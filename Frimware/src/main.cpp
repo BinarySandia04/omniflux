@@ -5,7 +5,6 @@
 #include <demos/lv_demos.h>
 #include <Arduino_GFX_Library.h>
 #include "bsp_cst816.h"
-
 /*To use the built-in examples and demos of LVGL uncomment the includes below respectively.
  *You also need to copy `lvgl/examples` to `lvgl/src/examples`. Similarly for the demos `lvgl/demos` to `lvgl/src/demos`.
  Note that the `lv_examples` library is for LVGL v7 and you shouldn't install it for this version (since LVGL v8)
@@ -194,17 +193,11 @@ void setup() {
   if (!gfx->begin()) {
     Serial.println("gfx->begin() failed!");
   }
-  gfx->fillScreen(BLACK);
+  gfx->fillScreen(RGB565_BLACK);
 
 #ifdef EXAMPLE_PIN_NUM_LCD_BL
-    constexpr uint8_t backlight_channel = 0;
-
-    ledcSetup(backlight_channel, LEDC_FREQ, LEDC_TIMER_10_BIT);
-    ledcAttachPin(EXAMPLE_PIN_NUM_LCD_BL, backlight_channel);
-
-    // Brillo al 80 %.
-    ledcWrite(backlight_channel,
-              ((1U << LEDC_TIMER_10_BIT) - 1) * 80 / 100);
+  ledcAttach(EXAMPLE_PIN_NUM_LCD_BL , LEDC_FREQ, LEDC_TIMER_10_BIT);
+  ledcWrite(EXAMPLE_PIN_NUM_LCD_BL , (1 << LEDC_TIMER_10_BIT) / 100 * 80);
 #endif
 
   // Init touch device
