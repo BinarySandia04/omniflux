@@ -1,280 +1,209 @@
-/*Using LVGL with Arduino requires some extra steps:
- *Be sure to read the docs here: https://docs.lvgl.io/master/get-started/platforms/arduino.html  */
-
-#include <lvgl.h>
-#include <demos/lv_demos.h>
-#include <Arduino_GFX_Library.h>
-#include "bsp_cst816.h"
-/*To use the built-in examples and demos of LVGL uncomment the includes below respectively.
- *You also need to copy `lvgl/examples` to `lvgl/src/examples`. Similarly for the demos `lvgl/demos` to `lvgl/src/demos`.
- Note that the `lv_examples` library is for LVGL v7 and you shouldn't install it for this version (since LVGL v8)
- as the examples and demos are now part of the main LVGL library. */
-
-// #include <examples/lv_examples.h>
-// #include <demos/lv_demos.h>
-
 #include "FastIMU.h"
 #include <Wire.h>
 
-#define IMU_ADDRESS 0x6B    //Change to the address of the IMU
-#define PERFORM_CALIBRATION //Comment to disable startup calibration
-QMI8658 IMU;               //Change to the name of any supported IMU! 
+#define IMU_ADDRESS 0x6B        // Change to the address of the IMU
+#define PERFORM_CALIBRATION      // Comment to disable startup calibration
 
-calData calib = { 0 };  //Calibration data
-AccelData accelData;    //Sensor data
-GyroData gyroData;
-MagData magData;
+QMI8658 IMU;                     // Keep the same IMU type as your original
 
-#define EXAMPLE_PIN_NUM_LCD_SCLK 39
-#define EXAMPLE_PIN_NUM_LCD_MOSI 38
-#define EXAMPLE_PIN_NUM_LCD_MISO 40
-#define EXAMPLE_PIN_NUM_LCD_DC 42
-#define EXAMPLE_PIN_NUM_LCD_RST -1
-#define EXAMPLE_PIN_NUM_LCD_CS 45
-#define EXAMPLE_PIN_NUM_LCD_BL 1
-#define EXAMPLE_PIN_NUM_TP_SDA 48
-#define EXAMPLE_PIN_NUM_TP_SCL 47
+// Currently supported IMUS: MPU9255 MPU9250 MPU6886 MPU6500 MPU6050 ICM20689 ICM20690 BMI055 BMX055 BMI160 LSM6DS3 LSM6DSL QMI8658
 
-#define LEDC_FREQ             5000
-#define LEDC_TIMER_10_BIT     10
+calData calib = { 0 };  // Calibration data
+AccelData accelData;    // Sensor data
+GyroData  gyroData;
+MagData   magData;
 
+// ===== Gesture logging config (minimal additions) =====
+static const uint16_t NUM_SAMPLES        = 100;   // ~2 s @ 50 Hz
+static const uint16_t SAMPLE_PERIOD_MS   = 20;    // 50 Hz
+static const float    ACC_TRIGGER_G      = 0.20f; // motion start threshold
+static const uint16_t NUM_REPS_PER_CLASS = 30;
 
-#define EXAMPLE_LCD_ROTATION 0
-#define EXAMPLE_LCD_H_RES 240
-#define EXAMPLE_LCD_V_RES 320
+static volatile uint8_t current_label    = 1;     // 1 or 2
+static volatile bool    request_one_burst = false;
+static volatile bool    request_30_reps   = false;
+static bool             is_capturing      = false;
 
+// --- tiny helpers (additions) ---
+void print_help() {
+  Serial.println(F("\n=== Gesture Logger (Serial) ==="));
+  Serial.println(F("1 -> set label to 1"));
+  Serial.println(F("2 -> set label to 2"));
+  Serial.println(F("b -> record ONE burst"));
+  Serial.println(F("r -> record 30 bursts"));
+  Serial.println(F("h -> help"));
+}
 
-/* More data bus class: https://github.com/moononournation/Arduino_GFX/wiki/Data-Bus-Class */
-Arduino_DataBus *bus = new Arduino_ESP32SPI(
-  EXAMPLE_PIN_NUM_LCD_DC /* DC */, EXAMPLE_PIN_NUM_LCD_CS /* CS */,
-  EXAMPLE_PIN_NUM_LCD_SCLK /* SCK */, EXAMPLE_PIN_NUM_LCD_MOSI /* MOSI */, EXAMPLE_PIN_NUM_LCD_MISO /* MISO */);
+// Wait until acceleration deviates from a short baseline by ACC_TRIGGER_G
+bool wait_for_motion(uint32_t timeout_ms = 10000) {
+  // Baseline
+  float ax0 = 0, ay0 = 0, az0 = 0;
+  int   n   = 0;
+  uint32_t t0 = millis();
 
-/* More display class: https://github.com/moononournation/Arduino_GFX/wiki/Display-Class */
-Arduino_GFX *gfx = new Arduino_ST7789(
-  bus, EXAMPLE_PIN_NUM_LCD_RST /* RST */, EXAMPLE_LCD_ROTATION /* rotation */, true /* IPS */,
-  EXAMPLE_LCD_H_RES /* width */, EXAMPLE_LCD_V_RES /* height */);
-
-
-/*******************************************************************************
- * End of Arduino_GFX setting
- ******************************************************************************/
-
-/*******************************************************************************
- * Please config the touch panel in touch.h
- ******************************************************************************/
-// #include "touch.h"
-
-uint32_t screenWidth;
-uint32_t screenHeight;
-uint32_t bufSize;
-lv_disp_draw_buf_t draw_buf;
-lv_color_t *disp_draw_buf;
-lv_disp_drv_t disp_drv;
-
-
-lv_obj_t *label_accel_x;
-lv_obj_t *label_accel_y;
-lv_obj_t *label_accel_z;
-lv_obj_t *label_gyro_x;
-lv_obj_t *label_gyro_y;
-lv_obj_t *label_gyro_z;
-lv_obj_t *label_temp;
-
-lv_timer_t *qmi8658_timer = NULL;
-
-
-static void qmi8658_callback(lv_timer_t *timer) {
-  char str_buffer[20];
-  IMU.update();
-  IMU.getAccel(&accelData);
-  
-  snprintf(str_buffer, sizeof(str_buffer), "%.2f", accelData.accelX);
-  lv_label_set_text(label_accel_x, str_buffer);
-  snprintf(str_buffer, sizeof(str_buffer), "%.2f", accelData.accelY);
-  lv_label_set_text(label_accel_y, str_buffer);
-  snprintf(str_buffer, sizeof(str_buffer), "%.2f", accelData.accelZ);
-  lv_label_set_text(label_accel_z, str_buffer);
-  
-  IMU.getGyro(&gyroData);
-  snprintf(str_buffer, sizeof(str_buffer), "%.2f", gyroData.gyroX);
-  lv_label_set_text(label_gyro_x, str_buffer);
-  snprintf(str_buffer, sizeof(str_buffer), "%.2f", gyroData.gyroY);
-  lv_label_set_text(label_gyro_y, str_buffer);
-  snprintf(str_buffer, sizeof(str_buffer), "%.2f", gyroData.gyroZ);
-  lv_label_set_text(label_gyro_z, str_buffer);
-  
-  if (IMU.hasTemperature()) {
-    snprintf(str_buffer, sizeof(str_buffer), "%.2fC", IMU.getTemp());
-    lv_label_set_text(label_temp, str_buffer);
+  while (n < 20 && millis() - t0 < 1000) {
+    IMU.update();
+    IMU.getAccel(&accelData);
+    ax0 += accelData.accelX;
+    ay0 += accelData.accelY;
+    az0 += accelData.accelZ;
+    n++;
+    delay(5);
   }
-  
-}
+  if (n == 0) return false;
+  ax0 /= n; ay0 /= n; az0 /= n;
 
-
-void lvgl_qmi8658_ui_init(lv_obj_t *parent) {
-  lv_obj_t *list = lv_list_create(parent);
-  lv_obj_set_size(list, lv_pct(100), lv_pct(100));
-
-  lv_obj_t *list_item = lv_list_add_btn(list, NULL, "accel_x");
-  label_accel_x = lv_label_create(list_item);
-  lv_label_set_text(label_accel_x, "0.00");
-
-  list_item = lv_list_add_btn(list, NULL, "accel_y");
-  label_accel_y = lv_label_create(list_item);
-  lv_label_set_text(label_accel_y, "0.00");
-
-  list_item = lv_list_add_btn(list, NULL, "accel_z");
-  label_accel_z = lv_label_create(list_item);
-  lv_label_set_text(label_accel_z, "0.00");
-
-  list_item = lv_list_add_btn(list, NULL, "gyro_x");
-  label_gyro_x = lv_label_create(list_item);
-  lv_label_set_text(label_gyro_x, "0.00");
-
-  list_item = lv_list_add_btn(list, NULL, "gyro_y");
-  label_gyro_y = lv_label_create(list_item);
-  lv_label_set_text(label_gyro_y, "0.00");
-
-  list_item = lv_list_add_btn(list, NULL, "gyro_z");
-  label_gyro_z = lv_label_create(list_item);
-  lv_label_set_text(label_gyro_z, "0.00");
-
-  list_item = lv_list_add_btn(list, NULL, "temp");
-  label_temp = lv_label_create(list_item);
-  lv_label_set_text(label_temp, "0.00C");
-
-  qmi8658_timer = lv_timer_create(qmi8658_callback, 100, NULL);
-}
-
-
-
-
-#if LV_USE_LOG != 0
-/* Serial debugging */
-void my_print(const char *buf) {
-  Serial.printf(buf);
-  Serial.flush();
-}
-#endif
-
-/* Display flushing */
-void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
-  lv_disp_flush_ready(disp_drv);
-}
-
-/*Read the touchpad*/
-void my_touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
-  uint16_t touchpad_x;
-  uint16_t touchpad_y;
-  bsp_touch_read();
-  if (bsp_touch_get_coordinates(&touchpad_x, &touchpad_y)) {
-    data->point.x = touchpad_x;
-    data->point.y = touchpad_y;
-    data->state = LV_INDEV_STATE_PRESSED;
-  } else {
-    data->state = LV_INDEV_STATE_RELEASED;
+  // Wait for deviation
+  t0 = millis();
+  while (millis() - t0 < timeout_ms) {
+    IMU.update();
+    IMU.getAccel(&accelData);
+    float dx = fabsf(accelData.accelX - ax0)
+             + fabsf(accelData.accelY - ay0)
+             + fabsf(accelData.accelZ - az0);
+    if (dx > ACC_TRIGGER_G) return true;
+    delay(5);
   }
+  return false;
+}
+
+// Capture one window and print CSV lines
+bool capture_burst_stream(uint8_t label, uint16_t rep) {
+  if (!wait_for_motion(10000)) {
+    Serial.println("# Timeout waiting motion");
+    return false;
+  }
+
+  uint32_t t_start = millis();
+  for (uint16_t i = 0; i < NUM_SAMPLES; i++) {
+    IMU.update();
+    IMU.getAccel(&accelData);
+    IMU.getGyro(&gyroData);
+
+    uint32_t t_ms = millis() - t_start;
+
+    // CSV: label,rep,idx,t_ms,ax,ay,az,gx,gy,gz
+    Serial.printf("%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                  label, rep, i, t_ms,
+                  accelData.accelX, accelData.accelY, accelData.accelZ,
+                  gyroData.gyroX,   gyroData.gyroY,   gyroData.gyroZ);
+
+    // Pace to 50 Hz
+    uint32_t t_next = t_start + (i + 1) * SAMPLE_PERIOD_MS;
+    int32_t  dt     = (int32_t)t_next - (int32_t)millis();
+    if (dt > 0) delay(dt);
+  }
+  return true;
 }
 
 void setup() {
+  Wire.begin(48, 47);
+  Wire.setClock(400000); // 400 kHz clock
   Serial.begin(115200);
+  while (!Serial) { ; }
 
-  // Serial.setDebugOutput(true);
-  // while(!Serial);
-  Serial.println("Arduino_GFX LVGL_Arduino_v8 example ");
-  String LVGL_Arduino = String('V') + lv_version_major() + "." + lv_version_minor() + "." + lv_version_patch();
-  Serial.println(LVGL_Arduino);
-
-#ifdef GFX_EXTRA_PRE_INIT
-  GFX_EXTRA_PRE_INIT();
-#endif
-
-  // Init Display
-  if (!gfx->begin()) {
-    Serial.println("gfx->begin() failed!");
-  }
-  gfx->fillScreen(RGB565_BLACK);
-
-#ifdef EXAMPLE_PIN_NUM_LCD_BL
-  ledcAttach(EXAMPLE_PIN_NUM_LCD_BL , LEDC_FREQ, LEDC_TIMER_10_BIT);
-  ledcWrite(EXAMPLE_PIN_NUM_LCD_BL , (1 << LEDC_TIMER_10_BIT) / 100 * 80);
-#endif
-
-  // Init touch device
-  // touch_init(gfx->width(), gfx->height(), gfx->getRotation());
-  Wire.begin(EXAMPLE_PIN_NUM_TP_SDA, EXAMPLE_PIN_NUM_TP_SCL);
-  bsp_touch_init(&Wire, gfx->getRotation(), gfx->width(), gfx->height());
   int err = IMU.init(calib, IMU_ADDRESS);
   if (err != 0) {
     Serial.print("Error initializing IMU: ");
     Serial.println(err);
-    while (true) {
-      ;
-    }
+    while (true) { ; }
   }
 
+#ifdef PERFORM_CALIBRATION
+  Serial.println("FastIMU calibration & data example");
+  if (IMU.hasMagnetometer()) {
+    delay(1000);
+    Serial.println("Move IMU in figure 8 pattern until done.");
+    delay(3000);
+    IMU.calibrateMag(&calib);
+    Serial.println("Magnetic calibration done!");
+  }
+  else {
+    delay(5000);
+  }
 
-  lv_init();
-
-#if LV_USE_LOG != 0
-  lv_log_register_print_cb(my_print); /* register print function for debugging */
+  delay(5000);
+  Serial.println("Keep IMU level.");
+  delay(5000);
+  IMU.calibrateAccelGyro(&calib);
+  Serial.println("Calibration done!");
+  Serial.println("Accel biases X/Y/Z: ");
+  Serial.print(calib.accelBias[0]); Serial.print(", ");
+  Serial.print(calib.accelBias[1]); Serial.print(", ");
+  Serial.println(calib.accelBias[2]);
+  Serial.println("Gyro biases X/Y/Z: ");
+  Serial.print(calib.gyroBias[0]); Serial.print(", ");
+  Serial.print(calib.gyroBias[1]); Serial.print(", ");
+  Serial.println(calib.gyroBias[2]);
+  if (IMU.hasMagnetometer()) {
+    Serial.println("Mag biases X/Y/Z: ");
+    Serial.print(calib.magBias[0]); Serial.print(", ");
+    Serial.print(calib.magBias[1]); Serial.print(", ");
+    Serial.println(calib.magBias[2]);
+    Serial.println("Mag Scale X/Y/Z: ");
+    Serial.print(calib.magScale[0]); Serial.print(", ");
+    Serial.print(calib.magScale[1]); Serial.print(", ");
+    Serial.println(calib.magScale[2]);
+  }
+  delay(5000);
+  IMU.init(calib, IMU_ADDRESS);
 #endif
 
-  screenWidth = gfx->width();
-  screenHeight = gfx->height();
-
-  bufSize = screenWidth * screenHeight;
-
-
-  disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!disp_draw_buf) {
-    // remove MALLOC_CAP_INTERNAL flag try again
-    disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_8BIT);
+  // err = IMU.setGyroRange(500);
+  // err = IMU.setAccelRange(2);
+  if (err != 0) {
+    Serial.print("Error Setting range: ");
+    Serial.println(err);
+    while (true) { ; }
   }
 
-
-  if (!disp_draw_buf) {
-    Serial.println("LVGL disp_draw_buf allocate failed!");
-  } else {
-    lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, NULL, bufSize);
-
-    /* Initialize the display */
-    lv_disp_drv_init(&disp_drv);
-    /* Change the following line to your display resolution */
-    disp_drv.hor_res = screenWidth;
-    disp_drv.ver_res = screenHeight;
-    disp_drv.flush_cb = my_disp_flush;
-    disp_drv.draw_buf = &draw_buf;
-    disp_drv.direct_mode = true;
-
-    lv_disp_drv_register(&disp_drv);
-
-    /* Initialize the (dummy) input device driver */
-    static lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = my_touchpad_read;
-    lv_indev_drv_register(&indev_drv);
-
-
-    /* Option 3: Or try out a demo. Don't forget to enable the demos in lv_conf.h. E.g. LV_USE_DEMOS_WIDGETS*/
-    lvgl_qmi8658_ui_init(lv_scr_act());
-    // lv_demo_widgets();
-    // lv_demo_benchmark();
-    // lv_demo_keypad_encoder();
-    // lv_demo_music();
-    // lv_demo_stress();
-  }
-
-  Serial.println("Setup done");
+  print_help();
 }
 
 void loop() {
-  lv_timer_handler(); /* let the GUI do its work */
-#if (LV_COLOR_16_SWAP != 0)
-  gfx->draw16bitBeRGBBitmap(0, 0, (uint16_t *)disp_draw_buf, screenWidth, screenHeight);
-#else
-  gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)disp_draw_buf, screenWidth, screenHeight);
-#endif
-  delay(5);
+  // --- Minimal serial UI for gesture logging (added) ---
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == '1') { current_label = 1; Serial.println("# Label=1"); }
+    else if (c == '2') { current_label = 2; Serial.println("# Label=2"); }
+    else if (c == 'b') { request_one_burst = true; }
+    else if (c == 'r') { request_30_reps   = true; }
+    else if (c == 'h' || c == '?') { print_help(); }
+  }
+
+  // --- Record ONE burst (CSV) ---
+  if (request_one_burst && !is_capturing) {
+    is_capturing = true;
+    request_one_burst = false;
+
+    Serial.println("###CSV_BEGIN");
+    Serial.println("label,rep,idx,t_ms,ax,ay,az,gx,gy,gz");
+    bool ok = capture_burst_stream(current_label, 0);
+    Serial.println("###CSV_END");
+    if (!ok) Serial.println("# No motion / failed");
+
+    is_capturing = false;
+  }
+
+  // --- Record 30 bursts (CSV) ---
+  if (request_30_reps && !is_capturing) {
+    is_capturing = true;
+    request_30_reps = false;
+
+    Serial.println("###CSV_BEGIN");
+    Serial.println("label,rep,idx,t_ms,ax,ay,az,gx,gy,gz");
+
+    for (uint16_t rep = 1; rep <= NUM_REPS_PER_CLASS; rep++) {
+      //Serial.printf("# Recording rep %u/%u (label=%u)\n", rep, NUM_REPS_PER_CLASS, current_label);
+      if (!capture_burst_stream(current_label, rep)) {
+        Serial.println("# Timeout. Re-run 'r' when ready.");
+        break;
+      }
+      delay(300);
+    }
+
+    Serial.println("###CSV_END");
+    is_capturing = false;
+  }
+
 }
