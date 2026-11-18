@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "FastIMU.h"
+#include "bsp_cst816.h"          // touch panel (CST816) on the shared I2C bus
 #include "scaler.h"              // g_mean, g_scale, INPUT_DIM, NUM_CLASSES, GESTURE_CLASSES
 #include "model_int8_weights.h"  // int8 weights, multipliers, quantisation params
 
@@ -28,6 +29,12 @@ GyroData  gyroData;
 
 // ---------- Capture buffer: 100 samples x 6 channels = 600 features ----------
 float sensor_data[INPUT_DIM];
+
+// ---------- Touch panel (CST816, same I2C bus as the IMU) ----------
+#define LCD_ROTATION 1
+#define LCD_WIDTH    240
+#define LCD_HEIGHT   320
+bool touch_ok = false;
 
 // ================= Sensor capture =================
 // 100 samples @ 50 Hz, order ax, ay, az, gx, gy, gz — matches the training CSVs.
@@ -181,6 +188,10 @@ void setup() {
   Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);   // I2C for the QMI8658 (shared with touch)
   Wire.setClock(400000);
 
+  // Touch panel on the same bus — tap anywhere to start a detection.
+  touch_ok = bsp_touch_init(&Wire, LCD_ROTATION, LCD_WIDTH, LCD_HEIGHT);
+  if (!touch_ok) Serial.println("Touch init failed (tap trigger disabled)");
+
   if (IMU.init(calib, IMU_ADDRESS) != 0) {
     Serial.println("IMU init failed");
     while (1) {}
@@ -206,13 +217,27 @@ void setup() {
   Serial.printf("accel at rest: ax=%.2f ay=%.2f az=%.2f | |a|=%.2f g (expect ~1.00)\n",
                 accelData.accelX, accelData.accelY, accelData.accelZ, gravity);
 
-  Serial.printf("Ready: %d classes, %d features, int8 %d layers. 'b' = classify\n",
+  Serial.printf("Ready: %d classes, %d features, int8 %d layers. Tap screen or 'b' = classify\n",
                 NUM_CLASSES, INPUT_DIM, NUM_DENSE);
   Serial.printf("classes: 0=%s, 1=%s\n", GESTURE_CLASSES[0], GESTURE_CLASSES[1]);
 }
 
 void loop() {
-  if (Serial.available() && Serial.read() == 'b') {
+  bool trigger = false;
+
+  // serial trigger (kept for convenience)
+  if (Serial.available() && Serial.read() == 'b')
+    trigger = true;
+
+  // touch trigger: any tap on the display starts a detection
+  if (touch_ok) {
+    uint16_t tx = 0, ty = 0;
+    bsp_touch_read();
+    if (bsp_touch_get_coordinates(&tx, &ty))
+      trigger = true;
+  }
+
+  if (trigger) {
     Serial.println("Move now...");
     if (!waitForMotion()) {
       Serial.println("#RESULT timeout (no movement)");

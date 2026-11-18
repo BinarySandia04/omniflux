@@ -9,6 +9,7 @@
             "name": "PlatformIO",
             "includePath": [
                 "/home/jordi/MERIT/IOTSS/omniflux/Frimware/src",
+                "/home/jordi/MERIT/IOTSS/omniflux/Frimware/lib/bsp_cst816",
                 "/home/jordi/MERIT/IOTSS/omniflux/Frimware/.pio/libdeps/esp32_s3_touch_lcd_2/FastIMU/src",
                 "/home/jordi/MERIT/IOTSS/omniflux/Frimware/.pio/libdeps/esp32_s3_touch_lcd_2/GFX Library for Arduino/src",
                 "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
@@ -361,7 +362,6 @@
                 "/home/jordi/.platformio/packages/framework-arduinoespressif32-libs/esp32s3/qio_opi/include",
                 "/home/jordi/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                 "/home/jordi/.platformio/packages/framework-arduinoespressif32/variants/esp32s3",
-                "/home/jordi/MERIT/IOTSS/omniflux/Frimware/lib/bsp_cst816",
                 "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
                 "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/AsyncUDP/src",
                 "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src",
@@ -409,6 +409,7 @@
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
                     "/home/jordi/MERIT/IOTSS/omniflux/Frimware/src",
+                    "/home/jordi/MERIT/IOTSS/omniflux/Frimware/lib/bsp_cst816",
                     "/home/jordi/MERIT/IOTSS/omniflux/Frimware/.pio/libdeps/esp32_s3_touch_lcd_2/FastIMU/src",
                     "/home/jordi/MERIT/IOTSS/omniflux/Frimware/.pio/libdeps/esp32_s3_touch_lcd_2/GFX Library for Arduino/src",
                     "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
@@ -761,7 +762,6 @@
                     "/home/jordi/.platformio/packages/framework-arduinoespressif32-libs/esp32s3/qio_opi/include",
                     "/home/jordi/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                     "/home/jordi/.platformio/packages/framework-arduinoespressif32/variants/esp32s3",
-                    "/home/jordi/MERIT/IOTSS/omniflux/Frimware/lib/bsp_cst816",
                     "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
                     "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/AsyncUDP/src",
                     "/home/jordi/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src",
