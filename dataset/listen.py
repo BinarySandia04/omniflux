@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 # === User config ===
-PORT = "/dev/ttyACM0"  # <-- change to your ESP32 port (check: ls /dev/ttyUSB* /dev/ttyACM*)
+PORT = "/dev/ttyACM1"  # <-- change to your ESP32 port (check: ls /dev/ttyUSB* /dev/ttyACM*)
 BAUD = 115200          # must match the firmware's Serial.begin(115200)
 OUTDIR = "captures"    # directory for saved CSVs
 ECHO_DATA = True       # True = print every CSV line; False = only show progress
