@@ -11,6 +11,7 @@
 // The capture sketch (to record more dataset samples) is kept at the end, in `#if 0`.
 
 #include <Arduino.h>
+#include <Arduino_GFX_Library.h>
 #include <Wire.h>
 #include <math.h>
 #include <stdint.h>
@@ -42,6 +43,23 @@ QMI8658   IMU;
 calData   calib = {0};
 AccelData accelData;
 GyroData  gyroData;
+
+// ---------- LCD (ST7789, SPI) ----------
+#define PIN_LCD_SCLK 39
+#define PIN_LCD_MOSI 38
+#define PIN_LCD_MISO 40
+#define PIN_LCD_DC   42
+#define PIN_LCD_RST  -1
+#define PIN_LCD_CS   45
+#define PIN_LCD_BL   1
+#define LCD_ROTATION 0
+#define LCD_H_RES    240
+#define LCD_V_RES    320
+
+Arduino_DataBus *lcd_bus = new Arduino_ESP32SPI(
+    PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_SCLK, PIN_LCD_MOSI, PIN_LCD_MISO);
+Arduino_GFX *lcd = new Arduino_ST7789(
+    lcd_bus, PIN_LCD_RST, LCD_ROTATION, true /*IPS*/, LCD_H_RES, LCD_V_RES);
 
 // ---------- Capture buffer: 100 samples x 6 channels = 600 features ----------
 float sensor_data[INPUT_DIM];
@@ -237,6 +255,19 @@ int classify(float *confidence) {
 #define BLE_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
+// The screen only identifies the board: player number, drawn once at boot.
+static void showPlayerNumber() {
+  constexpr uint8_t kScale = 16;                 // built-in font is 6x8 px
+  constexpr int kWidth = 6 * kScale;
+  constexpr int kHeight = 8 * kScale;
+
+  lcd->fillScreen(0x0000);
+  lcd->setTextColor(0xFFFF);
+  lcd->setTextSize(kScale);
+  lcd->setCursor((lcd->width() - kWidth) / 2, (lcd->height() - kHeight) / 2);
+  lcd->printf("%d", PLAYER_ID);
+}
+
 static BLECharacteristic *ble_tx = nullptr;
 static volatile bool ble_connected = false;
 static volatile bool ble_restart_advertising = false;
@@ -291,6 +322,12 @@ void setup() {
   // which delays (or appears to drop) every BLE notification. Drop debug
   // output instead.
   Serial.setTxTimeoutMs(0);
+
+  if (!lcd->begin()) Serial.println("LCD init failed");
+  ledcAttach(PIN_LCD_BL, 5000, 10);
+  ledcWrite(PIN_LCD_BL, (1 << 10) * 80 / 100);
+  showPlayerNumber();
+
   bleBegin();
 
   Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);   // I2C for the QMI8658

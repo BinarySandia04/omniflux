@@ -59,18 +59,28 @@ const classes = computed(() =>
 )
 
 // Confidence timeline: last 60 gestures, mapped into a 120x40 viewBox.
+// One line per player, x positions shared so the lines stay time-aligned.
+const playerColors = ['#34d399', '#60a5fa', '#fbbf24']
 const chart = computed(() => {
   const points = history.value.filter((p) => p.gesture >= 0).slice(-60)
   const mx = (i: number) =>
     points.length <= 1 ? 60 : (i / (points.length - 1)) * 120
   const my = (v: number) => 36 - v * 32
+
+  const grouped = new Map<number, { cx: number; cy: number }[]>()
+  points.forEach((p, i) => {
+    const id = p.player ?? 1
+    if (!grouped.has(id)) grouped.set(id, [])
+    grouped.get(id)!.push({ cx: mx(i), cy: my(p.confidence) })
+  })
+
   return {
     count: points.length,
-    line: points.map((p, i) => `${mx(i)},${my(p.confidence)}`).join(' '),
-    dots: points.map((p, i) => ({
-      cx: mx(i),
-      cy: my(p.confidence),
-      fill: p.gesture === 1 ? '#34d399' : '#60a5fa',
+    series: [...grouped.entries()].map(([id, pts]) => ({
+      id,
+      color: playerColors[(id - 1) % playerColors.length],
+      line: pts.map((p) => `${p.cx},${p.cy}`).join(' '),
+      dots: pts,
     })),
   }
 })
@@ -89,7 +99,10 @@ const chart = computed(() => {
     </header>
 
     <section v-for="player in livePlayers" :key="player.id" class="player-stats">
-      <h2>Player {{ player.id }}</h2>
+      <h2>
+        Player {{ player.id }}
+        <span class="transport">{{ player.transport === 'ble' ? 'Bluetooth' : 'Serial' }}</span>
+      </h2>
       <div class="cards">
         <article>
           <span>Gestures</span>
@@ -101,11 +114,6 @@ const chart = computed(() => {
           <small v-if="player.last && !player.idle && !player.moving">{{ pct(player.last.confidence) }} confidence</small>
           <small v-else-if="player.moving">Gesture in progress</small>
           <small v-else-if="player.idle">No movement detected</small>
-        </article>
-        <article>
-          <span>Connection</span>
-          <strong>{{ player.transport === 'ble' ? 'Bluetooth' : 'Serial' }}</strong>
-          <small>{{ player.name === 'serial' ? 'USB serial' : player.name }}</small>
         </article>
         <article>
           <span>Average confidence</span>
@@ -176,9 +184,16 @@ const chart = computed(() => {
       <h2>Confidence</h2>
       <svg viewBox="0 0 120 40" role="img" aria-label="Confidence of the last gestures">
         <line v-for="v in [0, 0.5, 1]" :key="v" x1="0" :y1="36 - v * 32" x2="120" :y2="36 - v * 32" class="grid" />
-        <polyline v-if="chart.count" :points="chart.line" class="line" />
-        <circle v-for="(d, i) in chart.dots" :key="i" :cx="d.cx" :cy="d.cy" r="1.2" :style="{ fill: d.fill }" />
+        <g v-for="s in chart.series" :key="s.id">
+          <polyline v-if="s.dots.length > 1" :points="s.line" class="line" :style="{ stroke: s.color }" />
+          <circle v-for="(d, i) in s.dots" :key="i" :cx="d.cx" :cy="d.cy" r="1.2" :style="{ fill: s.color }" />
+        </g>
       </svg>
+      <div v-if="chart.series.length" class="legend">
+        <span v-for="s in chart.series" :key="s.id">
+          <i :style="{ background: s.color }" />Player {{ s.id }}
+        </span>
+      </div>
       <div class="axis">
         <span>oldest</span>
         <span>last {{ chart.count }} gestures · confidence 0–100%</span>
@@ -281,6 +296,18 @@ header p {
   margin: 0 0 10px;
   font-size: 15px;
   color: #9ca3af;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.transport {
+  padding: 2px 8px;
+  border: 1px solid #232833;
+  border-radius: 999px;
+  background: #171a21;
+  color: #e5e7eb;
+  font-size: 12px;
+  font-weight: 600;
 }
 .cards {
   display: grid;
@@ -343,6 +370,23 @@ svg {
   color: #6b7280;
   font-size: 12px;
   margin-top: 6px;
+}
+.legend {
+  display: flex;
+  gap: 16px;
+  color: #9ca3af;
+  font-size: 12px;
+  margin-top: 8px;
+}
+.legend span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
 }
 .wrist {
   max-width: 420px;
