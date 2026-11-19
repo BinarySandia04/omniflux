@@ -1,132 +1,95 @@
-// OmniFlux — gesture recognition on ESP32-S3-Touch-LCD-2
-// Captures 100 IMU samples (50 Hz), normalizes with the training StandardScaler,
-// runs the embedded TFLite model, prints the result over serial and shows it on the LCD.
+// OmniFlux — wrist extension / flexion recognition on the ESP32-S3.
+// 'b' on the serial port = capture 100 IMU samples (50 Hz) and classify one gesture.
 //
-// Setup:
-//   1. Generate model_data.h:  cd Train && python export_model.py
-//   2. Build & flash:          pio run -e esp32_s3_touch_lcd_2 -t upload
-//   3. Use: send 'b' over serial (or tap the screen) to classify one gesture.
-//      'h' = help.
+// The network runs in int8 (same maths as TFLite's reference kernel), exported by
+// Train/export_int8.py from model_int8.tflite.
+//
+// The capture sketch (to record more dataset samples) is kept at the end, in `#if 0`.
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <math.h>
+#include <stdint.h>
+
 #include "FastIMU.h"
+#include "bsp_cst816.h"          // touch panel (CST816) on the shared I2C bus
+#include "scaler.h"              // g_mean, g_scale, INPUT_DIM, NUM_CLASSES, GESTURE_CLASSES
+#include "model_int8_weights.h"  // int8 weights, multipliers, quantisation params
 
-#include <Arduino_GFX_Library.h>
-#include <lvgl.h>
-#include "bsp_cst816.h"
+static_assert(INPUT_DIM == MODEL_IN_DIM, "model_int8_weights.h was exported for another input size");
 
-#include <TensorFlowLite_ESP32.h>
-#include "model_data.h"
-
-// ---------- IMU ----------
-#define IMU_ADDRESS          0x6B
-#define PERFORM_CALIBRATION  // comment to skip startup accel/gyro calibration
-QMI8658 IMU;
+// ---------- IMU (QMI8658, shares the I2C bus with the touch panel) ----------
+#define IMU_ADDRESS 0x6B
+#define PIN_IMU_SDA 48
+#define PIN_IMU_SCL 47
+QMI8658   IMU;
 calData   calib = {0};
 AccelData accelData;
 GyroData  gyroData;
 
-// ---------- LCD (ST7789, SPI) ----------
-#define PIN_LCD_SCLK 39
-#define PIN_LCD_MOSI 38
-#define PIN_LCD_MISO 40
-#define PIN_LCD_DC   42
-#define PIN_LCD_RST  -1
-#define PIN_LCD_CS   45
-#define PIN_LCD_BL   1
-#define PIN_TP_SDA   48
-#define PIN_TP_SCL   47
+// ---------- Capture buffer: 100 samples x 6 channels = 600 features ----------
+float sensor_data[INPUT_DIM];
 
-#define LCD_ROTATION 0
-#define LCD_H_RES    240
-#define LCD_V_RES    320
-#define LEDC_FREQ    5000
-#define LEDC_TIMER_10_BIT 10
+// ---------- Touch panel (CST816, same I2C bus as the IMU) ----------
+#define LCD_ROTATION 1
+#define LCD_WIDTH    240
+#define LCD_HEIGHT   320
+bool touch_ok = false;
 
-// ---------- Sampling (must match training: 100 samples @ 50 Hz) ----------
-#define NUM_SAMPLES      100
-#define SAMPLE_PERIOD_MS 20
-#define N_CH             6
-#define FEATURES         (NUM_SAMPLES * N_CH)   // 600
-#define ACC_TRIGGER_G    0.20f
+// ================= Sensor capture =================
+// 100 samples @ 50 Hz, order ax, ay, az, gx, gy, gz — matches the training CSVs.
+void collectSensorData() {
+  constexpr int kChannels = 6;
 
-Arduino_DataBus *bus = new Arduino_ESP32SPI(
-    PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_SCLK, PIN_LCD_MOSI, PIN_LCD_MISO);
-Arduino_GFX *gfx = new Arduino_ST7789(
-    bus, PIN_LCD_RST, LCD_ROTATION, true /*IPS*/, LCD_H_RES, LCD_V_RES);
+  for (int i = 0; i < INPUT_DIM / kChannels; i++) {
+    IMU.update();
+    IMU.getAccel(&accelData);
+    IMU.getGyro(&gyroData);
 
-// ---------- LVGL ----------
-static lv_color_t       *disp_draw_buf;
-static lv_disp_draw_buf_t draw_buf;
-static lv_disp_drv_t      disp_drv;
-static lv_obj_t *label_status  = nullptr;
-static lv_obj_t *label_gesture = nullptr;
+    sensor_data[i * kChannels + 0] = accelData.accelX;
+    sensor_data[i * kChannels + 1] = accelData.accelY;
+    sensor_data[i * kChannels + 2] = accelData.accelZ;
+    sensor_data[i * kChannels + 3] = gyroData.gyroX;
+    sensor_data[i * kChannels + 4] = gyroData.gyroY;
+    sensor_data[i * kChannels + 5] = gyroData.gyroZ;
 
-// ---------- TFLite Micro ----------
-static tflite::MicroMutableOpResolver<8> resolver;
-static const tflite::Model   *tfl_model   = nullptr;
-static tflite::MicroInterpreter *interpreter = nullptr;
-static TfLiteTensor *input  = nullptr;
-static TfLiteTensor *output = nullptr;
-static constexpr int   kTensorArenaSize = 512 * 1024;
-static uint8_t        *tensor_arena = nullptr;
-
-static float    g_raw[FEATURES];
-static volatile bool g_touch_pressed = false;
-
-// ================= LVGL glue =================
-void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
-  (void)area; (void)color_p;
-  lv_disp_flush_ready(drv);  // direct_mode: drawn straight into the framebuffer
-}
-
-void my_touchpad_read(lv_indev_drv_t *indev, lv_indev_data_t *data) {
-  uint16_t x, y;
-  bsp_touch_read();
-  if (bsp_touch_get_coordinates(&x, &y)) {
-    data->point.x = x;
-    data->point.y = y;
-    data->state   = LV_INDEV_STATE_PRESSED;
-    g_touch_pressed = true;
-  } else {
-    data->state   = LV_INDEV_STATE_RELEASED;
-    g_touch_pressed = false;
+    delay(20);   // 50 Hz — must match training
   }
 }
 
-void lvgl_tick() {
-  lv_timer_handler();
-#if (LV_COLOR_16_SWAP != 0)
-  gfx->draw16bitBeRGBBitmap(0, 0, (uint16_t *)disp_draw_buf, gfx->width(), gfx->height());
-#else
-  gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)disp_draw_buf, gfx->width(), gfx->height());
-#endif
+// Compact per-channel min/max of the captured window. Printed before classifying
+// so the live signal can be compared with the training CSVs.
+void printWindowStats() {
+  static const char *names[6] = {"ax", "ay", "az", "gx", "gy", "gz"};
+  Serial.print("#WINDOW");
+  for (int c = 0; c < 6; c++) {
+    float lo = sensor_data[c], hi = sensor_data[c];
+    for (int i = 1; i < INPUT_DIM / 6; i++) {
+      const float v = sensor_data[i * 6 + c];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    Serial.printf(" %s[%.1f..%.1f]", names[c], lo, hi);
+  }
+  Serial.println();
 }
 
-void ui_init() {
-  lv_obj_t *scr = lv_scr_act();
+// ================= Motion trigger =================
+// The dataset windows start when the movement starts, so the classifier must do
+// the same: 'b' arms it, the capture begins at the first acceleration change.
+#define ACC_TRIGGER_G 0.20f
 
-  label_status = lv_label_create(scr);
-  lv_label_set_text(label_status, "OmniFlux - Listo");
-  lv_obj_align(label_status, LV_ALIGN_TOP_MID, 0, 20);
-
-  label_gesture = lv_label_create(scr);
-  lv_label_set_text(label_gesture, "Pulsa 'b' o\ntoca la pantalla");
-  lv_obj_align(label_gesture, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_width(label_gesture, LCD_H_RES - 20);
-  lv_label_set_long_mode(label_gesture, LV_LABEL_LONG_WRAP);
-  lv_obj_set_style_text_align(label_gesture, LV_TEXT_ALIGN_CENTER, 0);
-}
-
-// ================= IMU capture =================
-bool wait_for_motion(uint32_t timeout_ms = 10000) {
+bool waitForMotion(uint32_t timeout_ms = 5000) {
   float ax0 = 0, ay0 = 0, az0 = 0;
   int   n = 0;
   uint32_t t0 = millis();
+
   while (n < 20 && millis() - t0 < 1000) {
-    IMU.update(); IMU.getAccel(&accelData);
-    ax0 += accelData.accelX; ay0 += accelData.accelY; az0 += accelData.accelZ;
+    IMU.update();
+    IMU.getAccel(&accelData);
+    ax0 += accelData.accelX;
+    ay0 += accelData.accelY;
+    az0 += accelData.accelZ;
     n++;
     delay(5);
   }
@@ -135,7 +98,8 @@ bool wait_for_motion(uint32_t timeout_ms = 10000) {
 
   t0 = millis();
   while (millis() - t0 < timeout_ms) {
-    IMU.update(); IMU.getAccel(&accelData);
+    IMU.update();
+    IMU.getAccel(&accelData);
     float dx = fabsf(accelData.accelX - ax0)
              + fabsf(accelData.accelY - ay0)
              + fabsf(accelData.accelZ - az0);
@@ -145,155 +109,365 @@ bool wait_for_motion(uint32_t timeout_ms = 10000) {
   return false;
 }
 
-// Fills raw[600] in the same order the notebook used (per sample: ax,ay,az,gx,gy,gz).
-bool capture(float *raw) {
-  if (!wait_for_motion(10000)) return false;
-
-  uint32_t t0 = millis();
-  for (int i = 0; i < NUM_SAMPLES; i++) {
-    IMU.update();
-    IMU.getAccel(&accelData);
-    IMU.getGyro(&gyroData);
-    int k = i * N_CH;
-    raw[k + 0] = accelData.accelX;
-    raw[k + 1] = accelData.accelY;
-    raw[k + 2] = accelData.accelZ;
-    raw[k + 3] = gyroData.gyroX;
-    raw[k + 4] = gyroData.gyroY;
-    raw[k + 5] = gyroData.gyroZ;
-
-    uint32_t t_next = t0 + (i + 1) * SAMPLE_PERIOD_MS;
-    int32_t  dt     = (int32_t)t_next - (int32_t)millis();
-    if (dt > 0) delay(dt);
-  }
-  return true;
+// ================= Inference (int8) =================
+// TFLite's reference fixed-point helpers.
+static inline int32_t saturatingRoundingDoublingHighMul(int32_t a, int32_t b) {
+  const bool overflow = (a == b) && (a == INT32_MIN);
+  const int64_t ab = (int64_t)a * b;
+  const int32_t nudge = ab >= 0 ? (1 << 30) : (1 - (1 << 30));
+  const int32_t high = (int32_t)((ab + nudge) / (1LL << 31));
+  return overflow ? INT32_MAX : high;
 }
 
-// ================= Inference =================
-int classify(float *raw, float *confidence) {
-  for (int i = 0; i < FEATURES; i++)
-    input->data.f[i] = (raw[i] - g_mean[i]) / g_scale[i];  // StandardScaler on-device
+static inline int32_t roundingDivideByPOT(int32_t x, int exponent) {
+  if (exponent == 0) return x;
+  const int32_t mask = (1 << exponent) - 1;
+  const int32_t remainder = x & mask;
+  const int32_t threshold = (mask >> 1) + (x < 0 ? 1 : 0);
+  return (x >> exponent) + (remainder > threshold ? 1 : 0);
+}
 
-  if (interpreter->Invoke() != kTfLiteOk) return -1;
+static inline int32_t multiplyByQuantizedMultiplier(int32_t x, int32_t mult, int shift) {
+  const int left = shift > 0 ? shift : 0;
+  const int right = shift > 0 ? 0 : -shift;
+  return roundingDivideByPOT(saturatingRoundingDoublingHighMul(x * (1 << left), mult), right);
+}
 
-  int best = 0;
-  for (int c = 1; c < NUM_CLASSES; c++)
-    if (output->data.f[c] > output->data.f[best]) best = c;
-  *confidence = output->data.f[best];
-  return best;
+static int8_t q_in[MODEL_IN_DIM];
+static int8_t buf_a[MAX_UNITS];
+static int8_t buf_b[MAX_UNITS];
+
+// Fully connected int8 chain. Returns P(flexion).
+static float predict(const float *x_norm) {
+  for (int i = 0; i < MODEL_IN_DIM; i++) {
+    int q = (int)roundf(x_norm[i] / IN_SCALE) + IN_ZERO;
+    q_in[i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
+  }
+
+  const int8_t *in = q_in;
+  int8_t *out = buf_a;
+
+  for (int l = 0; l < NUM_DENSE; l++) {
+    const int n_in = g_in_dim[l];
+    const int n_out = g_out_dim[l];
+    const int z_out = g_ozero[l];
+
+    for (int o = 0; o < n_out; o++) {
+      int32_t acc = g_b[l][o];
+      const int8_t *w = &g_W[l][o * n_in];
+      for (int i = 0; i < n_in; i++) acc += (int32_t)w[i] * in[i];
+
+      int32_t v = multiplyByQuantizedMultiplier(acc, g_mult[l][o], g_shift[l][o]) + z_out;
+      if (g_relu[l] && v < z_out) v = z_out;      // relu: 0 maps to the zero point
+      out[o] = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+    }
+
+    in = out;
+    out = (out == buf_a) ? buf_b : buf_a;
+  }
+
+  const int logit = (int)in[0] - g_ozero[NUM_DENSE - 1];
+  return 1.0f / (1.0f + expf(-(float)logit * g_oscale[NUM_DENSE - 1][0]));
+}
+
+// StandardScaler -> quantise -> network -> 0.5 threshold. Returns the class or -1.
+int classify(float *confidence) {
+  for (int i = 0; i < INPUT_DIM; i++)
+    sensor_data[i] = (sensor_data[i] - g_mean[i]) / g_scale[i];
+
+  const float p = predict(sensor_data);   // 0..1, 1 = flexion
+  const int cls = p > 0.5f ? 1 : 0;
+  *confidence = cls ? p : 1.0f - p;
+  return cls;
 }
 
 // ================= Setup / loop =================
 void setup() {
   Serial.begin(115200);
 
-  // Display
-  if (!gfx->begin()) Serial.println("gfx->begin() failed!");
-  gfx->fillScreen(BLACK);
-  ledcAttach(PIN_LCD_BL, LEDC_FREQ, LEDC_TIMER_10_BIT);
-  ledcWrite(PIN_LCD_BL, (1 << LEDC_TIMER_10_BIT) / 100 * 80);
-
-  // I2C bus shared by touch (0x15) and IMU (0x6B)
-  Wire.begin(PIN_TP_SDA, PIN_TP_SCL);
+  Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);   // I2C for the QMI8658 (shared with touch)
   Wire.setClock(400000);
-  bsp_touch_init(&Wire, gfx->getRotation(), gfx->width(), gfx->height());
 
-  // IMU
-  int err = IMU.init(calib, IMU_ADDRESS);
-  if (err != 0) { Serial.printf("IMU init error %d\n", err); while (1) {} }
-#ifdef PERFORM_CALIBRATION
+  // Touch panel on the same bus — tap anywhere to start a detection.
+  touch_ok = bsp_touch_init(&Wire, LCD_ROTATION, LCD_WIDTH, LCD_HEIGHT);
+  if (!touch_ok) Serial.println("Touch init failed (tap trigger disabled)");
+
+  if (IMU.init(calib, IMU_ADDRESS) != 0) {
+    Serial.println("IMU init failed");
+    while (1) {}
+  }
   Serial.println("Keep IMU still for calibration...");
-  delay(3000);
+  delay(2000);
   IMU.calibrateAccelGyro(&calib);
-  delay(100);
-  IMU.init(calib, IMU_ADDRESS);
-  Serial.println("Calibration done");
-#endif
 
-  // LVGL
-  lv_init();
-  uint32_t buf_px = (uint32_t)gfx->width() * gfx->height();
-  disp_draw_buf = (lv_color_t *)heap_caps_malloc(buf_px * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!disp_draw_buf)
-    disp_draw_buf = (lv_color_t *)heap_caps_malloc(buf_px * 2, MALLOC_CAP_8BIT);
-  lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, NULL, buf_px);
-
-  lv_disp_drv_init(&disp_drv);
-  disp_drv.hor_res   = gfx->width();
-  disp_drv.ver_res   = gfx->height();
-  disp_drv.flush_cb  = my_disp_flush;
-  disp_drv.draw_buf  = &draw_buf;
-  disp_drv.direct_mode = true;
-  lv_disp_drv_register(&disp_drv);
-
-  static lv_indev_drv_t indev_drv;
-  lv_indev_drv_init(&indev_drv);
-  indev_drv.type    = LV_INDEV_TYPE_POINTER;
-  indev_drv.read_cb = my_touchpad_read;
-  lv_indev_drv_register(&indev_drv);
-
-  ui_init();
-
-  // TFLite Micro (arena in PSRAM: float32 model ~350 KB doesn't fit internal SRAM)
-  tensor_arena = (uint8_t *)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM);
-  if (!tensor_arena)
-    tensor_arena = (uint8_t *)malloc(kTensorArenaSize);
-
-  resolver.AddFullyConnected();
-  resolver.AddRelu();
-  resolver.AddSoftmax();
-  resolver.AddReshape();
-
-  tfl_model = tflite::GetModel(g_model);
-  if (tfl_model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("Model schema version mismatch!"); while (1) {}
+  // calibrateAccelGyro() leaves the chip at +-2g / +-1024dps while the library
+  // still scales with +-16g / +-2000dps, and it does not apply the biases.
+  // Re-init to restore the ranges and load the calibration (same as the logger).
+  if (IMU.init(calib, IMU_ADDRESS) != 0) {
+    Serial.println("IMU re-init failed");
+    while (1) {}
   }
-  interpreter = new tflite::MicroInterpreter(tfl_model, resolver, tensor_arena, kTensorArenaSize);
-  if (interpreter->AllocateTensors() != kTfLiteOk) {
-    Serial.println("AllocateTensors failed!"); while (1) {}
-  }
-  input  = interpreter->input(0);
-  output = interpreter->output(0);
 
-  Serial.printf("Ready: %d classes, input tensor %u bytes\n", NUM_CLASSES, (unsigned)input->bytes);
-  Serial.println("b = clasificar gesto | toque = clasificar | h = ayuda");
-  lvgl_tick();
+  // Sanity check: at rest the accelerometer must read ~1 g.
+  IMU.update();
+  IMU.getAccel(&accelData);
+  const float gravity = sqrtf(accelData.accelX * accelData.accelX +
+                              accelData.accelY * accelData.accelY +
+                              accelData.accelZ * accelData.accelZ);
+  Serial.printf("accel at rest: ax=%.2f ay=%.2f az=%.2f | |a|=%.2f g (expect ~1.00)\n",
+                accelData.accelX, accelData.accelY, accelData.accelZ, gravity);
+
+  Serial.printf("Ready: %d classes, %d features, int8 %d layers. Tap screen or 'b' = classify\n",
+                NUM_CLASSES, INPUT_DIM, NUM_DENSE);
+  Serial.printf("classes: 0=%s, 1=%s\n", GESTURE_CLASSES[0], GESTURE_CLASSES[1]);
 }
 
 void loop() {
-  char c = 0;
-  if (Serial.available()) c = Serial.read();
+  bool trigger = false;
 
-  // Rising edge on touch = tap
-  static bool prev_pressed = false;
-  bool tap = g_touch_pressed && !prev_pressed;
-  prev_pressed = g_touch_pressed;
+  // serial trigger (kept for convenience)
+  if (Serial.available() && Serial.read() == 'b')
+    trigger = true;
 
-  if (c == 'b' || tap) {
-    lv_label_set_text(label_gesture, "Capturando...");
-    lvgl_tick();
-
-    if (capture(g_raw)) {
-      float conf = 0;
-      int cls = classify(g_raw, &conf);
-      if (cls < 0) {
-        Serial.println("#RESULT error");
-        lv_label_set_text(label_gesture, "Error");
-      } else {
-        Serial.printf("#RESULT %d %s %.2f\n", cls, GESTURE_CLASSES[cls], conf * 100.0f);
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%s\n%.0f%%", GESTURE_CLASSES[cls], conf * 100.0f);
-        lv_label_set_text(label_gesture, buf);
-      }
-    } else {
-      Serial.println("#RESULT none (no motion)");
-      lv_label_set_text(label_gesture, "Sin movimiento");
-    }
-    lvgl_tick();
-  } else if (c == 'h' || c == '?') {
-    Serial.println("b = clasificar gesto | toque = clasificar | h = ayuda");
+  // touch trigger: any tap on the display starts a detection
+  if (touch_ok) {
+    uint16_t tx = 0, ty = 0;
+    bsp_touch_read();
+    if (bsp_touch_get_coordinates(&tx, &ty))
+      trigger = true;
   }
 
-  lvgl_tick();
-  delay(5);
+  if (trigger) {
+    Serial.println("Move now...");
+    if (!waitForMotion()) {
+      Serial.println("#RESULT timeout (no movement)");
+    } else {
+      collectSensorData();
+      printWindowStats();
+
+      float conf = 0;
+      int cls = classify(&conf);
+      if (cls < 0) {
+        Serial.println("#RESULT error");
+      } else {
+        Serial.printf("#RESULT %d %s %.0f%%\n", cls, GESTURE_CLASSES[cls], conf * 100.0f);
+      }
+    }
+  }
+  delay(10);
 }
+
+// =====================================================================
+// MODO CAPTURA (desactivado: cambia #if 0 por #if 1 y comenta el
+// clasificador de arriba para volver a grabar muestras del dataset)
+// =====================================================================
+#if 0
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+
+#include "FastIMU.h"
+
+#define IMU_ADDRESS 0x6B    // Change to the address of the IMU
+#define PERFORM_CALIBRATION // Comment to disable startup calibration
+
+QMI8658 IMU;                // Change to the name of any supported IMU!
+
+calData   calib = {0};      // Calibration data
+AccelData accelData;        // Sensor data
+GyroData  gyroData;
+MagData   magData;
+
+// ===== Gesture logging config =====
+static const uint16_t NUM_SAMPLES        = 100;   // ~2 s @ 50 Hz
+static const uint16_t SAMPLE_PERIOD_MS   = 20;    // 50 Hz
+static const float    ACC_TRIGGER_G      = 0.20f; // motion start threshold
+static const uint16_t NUM_REPS_PER_CLASS = 30;
+
+static volatile uint8_t current_label     = 1;    // 1 or 2
+static volatile bool    request_one_burst = false;
+static volatile bool    request_30_reps   = false;
+static bool             is_capturing      = false;
+
+// --- tiny helpers ---
+void print_help() {
+  Serial.println(F("\n=== Gesture Logger (Serial) ==="));
+  Serial.println(F("1 -> set label to 1"));
+  Serial.println(F("2 -> set label to 2"));
+  Serial.println(F("b -> record ONE burst"));
+  Serial.println(F("r -> record 30 bursts"));
+  Serial.println(F("h -> help"));
+}
+
+// Wait until acceleration deviates from a short baseline by ACC_TRIGGER_G
+bool wait_for_motion(uint32_t timeout_ms = 10000) {
+  // Baseline
+  float ax0 = 0, ay0 = 0, az0 = 0;
+  int   n   = 0;
+  uint32_t t0 = millis();
+
+  while (n < 20 && millis() - t0 < 1000) {
+    IMU.update();
+    IMU.getAccel(&accelData);
+    ax0 += accelData.accelX;
+    ay0 += accelData.accelY;
+    az0 += accelData.accelZ;
+    n++;
+    delay(5);
+  }
+  if (n == 0) return false;
+  ax0 /= n; ay0 /= n; az0 /= n;
+
+  // Wait for deviation
+  t0 = millis();
+  while (millis() - t0 < timeout_ms) {
+    IMU.update();
+    IMU.getAccel(&accelData);
+    float dx = fabsf(accelData.accelX - ax0)
+             + fabsf(accelData.accelY - ay0)
+             + fabsf(accelData.accelZ - az0);
+    if (dx > ACC_TRIGGER_G) return true;
+    delay(5);
+  }
+  return false;
+}
+
+// Capture one window and print CSV lines
+bool capture_burst_stream(uint8_t label, uint16_t rep) {
+  if (!wait_for_motion(10000)) {
+    Serial.println("# Timeout waiting motion");
+    return false;
+  }
+
+  uint32_t t_start = millis();
+  for (uint16_t i = 0; i < NUM_SAMPLES; i++) {
+    IMU.update();
+    IMU.getAccel(&accelData);
+    IMU.getGyro(&gyroData);
+
+    uint32_t t_ms = millis() - t_start;
+
+    // CSV: label,rep,idx,t_ms,ax,ay,az,gx,gy,gz
+    Serial.printf("%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                  label, rep, i, t_ms,
+                  accelData.accelX, accelData.accelY, accelData.accelZ,
+                  gyroData.gyroX,   gyroData.gyroY,   gyroData.gyroZ);
+
+    // Pace to 50 Hz
+    uint32_t t_next = t_start + (i + 1) * SAMPLE_PERIOD_MS;
+    int32_t  dt     = (int32_t)t_next - (int32_t)millis();
+    if (dt > 0) delay(dt);
+  }
+  return true;
+}
+
+void setup() {
+  Wire.begin(48, 47);
+  Wire.setClock(400000); // 400 kHz clock
+  Serial.begin(115200);
+  while (!Serial) { ; }
+
+  int err = IMU.init(calib, IMU_ADDRESS);
+  if (err != 0) {
+    Serial.print("Error initializing IMU: ");
+    Serial.println(err);
+    while (true) { ; }
+  }
+
+#ifdef PERFORM_CALIBRATION
+  Serial.println("FastIMU calibration & data example");
+  if (IMU.hasMagnetometer()) {
+    delay(1000);
+    Serial.println("Move IMU in figure 8 pattern until done.");
+    delay(3000);
+    IMU.calibrateMag(&calib);
+    Serial.println("Magnetic calibration done!");
+  }
+  else {
+    delay(5000);
+  }
+
+  delay(5000);
+  Serial.println("Keep IMU level.");
+  delay(5000);
+  IMU.calibrateAccelGyro(&calib);
+  Serial.println("Calibration done!");
+  Serial.println("Accel biases X/Y/Z: ");
+  Serial.print(calib.accelBias[0]); Serial.print(", ");
+  Serial.print(calib.accelBias[1]); Serial.print(", ");
+  Serial.println(calib.accelBias[2]);
+  Serial.println("Gyro biases X/Y/Z: ");
+  Serial.print(calib.gyroBias[0]); Serial.print(", ");
+  Serial.print(calib.gyroBias[1]); Serial.print(", ");
+  Serial.println(calib.gyroBias[2]);
+  if (IMU.hasMagnetometer()) {
+    Serial.println("Mag biases X/Y/Z: ");
+    Serial.print(calib.magBias[0]); Serial.print(", ");
+    Serial.print(calib.magBias[1]); Serial.print(", ");
+    Serial.println(calib.magBias[2]);
+    Serial.println("Mag Scale X/Y/Z: ");
+    Serial.print(calib.magScale[0]); Serial.print(", ");
+    Serial.print(calib.magScale[1]); Serial.print(", ");
+    Serial.println(calib.magScale[2]);
+  }
+  delay(5000);
+  IMU.init(calib, IMU_ADDRESS);
+#endif
+
+  // err = IMU.setGyroRange(500);
+  // err = IMU.setAccelRange(2);
+  if (err != 0) {
+    Serial.print("Error Setting range: ");
+    Serial.println(err);
+    while (true) { ; }
+  }
+
+  print_help();
+}
+
+void loop() {
+  // --- Minimal serial UI for gesture logging ---
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == '1') { current_label = 1; Serial.println("# Label=1"); }
+    else if (c == '2') { current_label = 2; Serial.println("# Label=2"); }
+    else if (c == 'b') { request_one_burst = true; }
+    else if (c == 'r') { request_30_reps   = true; }
+    else if (c == 'h' || c == '?') { print_help(); }
+  }
+
+  // --- Record ONE burst (CSV) ---
+  if (request_one_burst && !is_capturing) {
+    is_capturing = true;
+    request_one_burst = false;
+
+    Serial.println("###CSV_BEGIN");
+    Serial.println("label,rep,idx,t_ms,ax,ay,az,gx,gy,gz");
+    bool ok = capture_burst_stream(current_label, 0);
+    Serial.println("###CSV_END");
+    if (!ok) Serial.println("# No motion / failed");
+
+    is_capturing = false;
+  }
+
+  // --- Record 30 bursts (CSV) ---
+  if (request_30_reps && !is_capturing) {
+    is_capturing = true;
+    request_30_reps = false;
+
+    Serial.println("###CSV_BEGIN");
+    Serial.println("label,rep,idx,t_ms,ax,ay,az,gx,gy,gz");
+
+    for (uint16_t rep = 1; rep <= NUM_REPS_PER_CLASS; rep++) {
+      if (!capture_burst_stream(current_label, rep)) {
+        Serial.println("# Timeout. Re-run 'r' when ready.");
+        break;
+      }
+      delay(300);
+    }
+
+    Serial.println("###CSV_END");
+    is_capturing = false;
+  }
+}
+#endif

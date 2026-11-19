@@ -1,36 +1,56 @@
 #!/usr/bin/env python3
-"""Export the trained Keras gesture model to a C header for the ESP32 firmware.
+"""Export the trained Keras MLP to a C header for the ESP32 firmware.
 
-Run this from the Train/ directory, AFTER training `model` and `scaler`
-in the notebook. First save them (two lines in a notebook cell):
+The model is Dense(relu) x N -> Dense(softmax). We export the weights + scaler
+and also EMIT the exact forward pass as a C function (`model_infer`), so the
+firmware does the same math with zero TensorFlow dependency.
 
-    model.save("model.keras")
-    import joblib; joblib.dump(scaler, "scaler.joblib")
+Temporal average-pooling: the notebook trains on pooled frames (stride 1/2/4)
+while the scaler is always fit on the FULL 600 features. So the firmware must
+normalize the raw 600 features, THEN pool by STRIDE, then run the model.
 
-Then:
+Run from the Train/ directory:
 
     python export_model.py
 
-It writes ../Frimware/src/model_data.h with:
-  - g_model[] / g_model_len        (float32 TFLite flatbuffer, embedded)
-  - g_mean[600] / g_scale[600]     (StandardScaler params, applied on-device)
-  - GESTURE_CLASSES[] / NUM_CLASSES (sorted folder names, same order as training)
+It auto-detects the model file (model_best.keras / model.keras / any *.keras)
+and the scaler (scaler.npz with mean/scale, or scaler.joblib), and writes
+../Frimware/src/model_data.h with:
+  - INPUT_DIM (raw/scaler size), STRIDE, POOLED_DIM, NUM_CLASSES
+  - g_mean[] / g_scale[]
+  - W0/b0, W1/b1, ... (Dense weights, row-major: W[i*units + o])
+  - GESTURE_CLASSES[]
+  - model_infer(const float* x, float* probs)
 """
+import glob
 import os
 import numpy as np
 
-MODEL_PATH = "model.keras"
-SCALER_PATH = "scaler.joblib"
 CAPTURES = "../dataset/captures"
 OUT_HEADER = "../Frimware/src/model_data.h"
 
 
-def c_byte_array(name, data):
-    lines = []
-    for i in range(0, len(data), 12):
-        row = ", ".join("0x%02x" % b for b in data[i:i + 12])
-        lines.append("    " + row + ",")
-    return "const unsigned char %s[] = {\n%s\n};\n" % (name, "\n".join(lines))
+def find_model():
+    for name in ("model_best.keras", "model.keras"):
+        if os.path.isfile(name):
+            return name
+    matches = sorted(glob.glob("*.keras"))
+    if not matches:
+        raise SystemExit("No .keras model found. Save it first: model.save('model.keras')")
+    return matches[0]
+
+
+def load_scaler():
+    if os.path.isfile("scaler.npz"):
+        d = np.load("scaler.npz")
+        assert "mean" in d and "scale" in d, "scaler.npz must have 'mean' and 'scale'"
+        return d["mean"], d["scale"]
+    if os.path.isfile("scaler.joblib"):
+        import joblib
+        s = joblib.load("scaler.joblib")
+        return s.mean_, s.scale_
+    raise SystemExit("No scaler found. Save scaler.npz (np.savez('scaler.npz', "
+                     "mean=scaler.mean_, scale=scaler.scale_)) or scaler.joblib.")
 
 
 def c_float_array(name, arr):
@@ -41,51 +61,97 @@ def c_float_array(name, arr):
     return "const float %s[%d] = {\n%s\n};\n" % (name, len(arr), "\n".join(lines))
 
 
+def gen_infer(weights, input_dim):
+    """Emit an unrolled forward pass: relu hidden layers, softmax output."""
+    n = len(weights)
+    out = ["static inline void model_infer(const float *x, float *probs) {"]
+    prev = "x"
+    for idx, (w, b) in enumerate(weights):
+        in_dim, units = w.shape
+        last = (idx == n - 1)
+        if last:
+            out.append("  float maxv = -1e30f;")
+            out.append("  for (int o = 0; o < %d; o++) {" % units)
+            out.append("    float a = b%d[o];" % idx)
+            out.append("    for (int i = 0; i < %d; i++) a += W%d[i * %d + o] * %s[i];"
+                       % (in_dim, idx, units, prev))
+            out.append("    probs[o] = a;")
+            out.append("    if (a > maxv) maxv = a;")
+            out.append("  }")
+            out.append("  float sum = 0;")
+            out.append("  for (int o = 0; o < %d; o++) { probs[o] = expf(probs[o] - maxv); sum += probs[o]; }" % units)
+            out.append("  for (int o = 0; o < %d; o++) probs[o] /= sum;" % units)
+        else:
+            out.append("  float h%d[%d];" % (idx, units))
+            out.append("  for (int o = 0; o < %d; o++) {" % units)
+            out.append("    float a = b%d[o];" % idx)
+            out.append("    for (int i = 0; i < %d; i++) a += W%d[i * %d + o] * %s[i];"
+                       % (in_dim, idx, units, prev))
+            out.append("    h%d[o] = a > 0 ? a : 0;" % idx)
+            out.append("  }")
+            prev = "h%d" % idx
+    out.append("}")
+    return "\n".join(out)
+
+
 def main():
     import tensorflow as tf
-    import joblib
 
-    model = tf.keras.models.load_model(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
+    model_path = find_model()
+    print("Using model:", model_path)
+    model = tf.keras.models.load_model(model_path)
 
-    mean = np.asarray(scaler.mean_, dtype=np.float32).ravel()
-    scale = np.asarray(scaler.scale_, dtype=np.float32).ravel()
-    assert mean.size == scale.size, "scaler mean/scale size mismatch"
+    mean, scale = load_scaler()
+    mean = np.asarray(mean, dtype=np.float32).ravel()
+    scale = np.asarray(scale, dtype=np.float32).ravel()
+    input_dim = mean.size  # raw/scaler feature count (600)
 
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    tflite = converter.convert()
+    # Dense layers (skip any Input/Flatten/Pooling layers without a kernel)
+    weighted = [l for l in model.layers if l.get_weights()]
+    assert weighted, "no Dense layers found in model"
+    weights = [l.get_weights() for l in weighted]
 
-    classes = sorted(
-        d for d in os.listdir(CAPTURES)
-        if os.path.isdir(os.path.join(CAPTURES, d))
-    )
-    assert classes, "no gesture classes found under %s" % CAPTURES
+    model_in = weights[0][0].shape[0]
+    assert input_dim % model_in == 0, "scaler dim (%d) not divisible by model input (%d)" % (input_dim, model_in)
+    stride = input_dim // model_in
+    pooled_dim = model_in
+    num_classes = weights[-1][0].shape[1]
+
+    classes = sorted(d for d in os.listdir(CAPTURES)
+                     if os.path.isdir(os.path.join(CAPTURES, d)))
+    assert len(classes) == num_classes, "classes dirs (%d) != model output (%d)" % (len(classes), num_classes)
 
     out = [
         "// AUTO-GENERATED by Train/export_model.py — do not edit by hand.",
-        "// float32 TFLite model; input 600 = 100 samples x 6 ch (ax,ay,az,gx,gy,gz, row-major).",
+        "// MLP: raw(%d) -> pool(stride %d) -> Dense relu x%d -> Dense softmax." % (input_dim, stride, len(weights) - 1),
         "#pragma once",
-        "#include <stddef.h>",
+        "#include <math.h>",
         "",
-        c_byte_array("g_model", tflite),
-        "const unsigned int g_model_len = %d;" % len(tflite),
+        "#define INPUT_DIM   %d" % input_dim,
+        "#define STRIDE      %d" % stride,
+        "#define POOLED_DIM  %d" % pooled_dim,
+        "#define NUM_CLASSES %d" % num_classes,
         "",
         c_float_array("g_mean", mean),
         c_float_array("g_scale", scale),
-        "",
-        "const int NUM_CLASSES = %d;" % len(classes),
-        "const char* const GESTURE_CLASSES[%d] = {" % len(classes),
     ]
+    for idx, (w, b) in enumerate(weights):
+        out.append(c_float_array("W%d" % idx, np.asarray(w, np.float32).ravel()))
+        out.append(c_float_array("b%d" % idx, np.asarray(b, np.float32).ravel()))
+    out.append("")
+    out.append(gen_infer([(np.asarray(w, np.float32), np.asarray(b, np.float32)) for w, b in weights], pooled_dim))
+    out.append("")
+    out.append("const char* const GESTURE_CLASSES[NUM_CLASSES] = {")
     for c in classes:
-        out.append('    "%s",' % c)
+        out.append('    "%s",' % (c[6:] if c.startswith("label_") else c))
     out.append("};")
 
     os.makedirs(os.path.dirname(OUT_HEADER), exist_ok=True)
     with open(OUT_HEADER, "w") as f:
         f.write("\n".join(out) + "\n")
 
-    print("Wrote %s (%d bytes model, %d classes, %d features)"
-          % (OUT_HEADER, len(tflite), len(classes), mean.size))
+    print("Wrote %s (%d classes, raw %d, stride %d, pooled %d, %d dense layers)"
+          % (OUT_HEADER, num_classes, input_dim, stride, pooled_dim, len(weights)))
 
 
 if __name__ == "__main__":
