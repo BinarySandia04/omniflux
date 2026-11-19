@@ -1,0 +1,13 @@
+{
+  "name": "omniflux-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt build",
+    "preview": "nuxt preview"
+  },
+  "dependencies": {
+    "nuxt": "^4.6.4"
+  }
+}

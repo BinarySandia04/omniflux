@@ -1,5 +1,9 @@
 // OmniFlux — wrist extension / flexion recognition on the ESP32-S3.
-// 'b' on the serial port = capture 100 IMU samples (50 Hz) and classify one gesture.
+// Runs continuously: every detected movement is classified and printed as one
+// JSON line on the USB serial port, e.g.
+//   {"gesture":1,"name":"FLEXION","confidence":0.87}
+// The gesture must be held through the 2 s capture window (that is how the
+// training data was recorded); a quick swing back to neutral is ignored.
 //
 // The network runs in int8 (same maths as TFLite's reference kernel), exported by
 // Train/export_int8.py from model_int8.tflite.
@@ -12,7 +16,6 @@
 #include <stdint.h>
 
 #include "FastIMU.h"
-#include "bsp_cst816.h"          // touch panel (CST816) on the shared I2C bus
 #include "scaler.h"              // g_mean, g_scale, INPUT_DIM, NUM_CLASSES, GESTURE_CLASSES
 #include "model_int8_weights.h"  // int8 weights, multipliers, quantisation params
 
@@ -29,12 +32,6 @@ GyroData  gyroData;
 
 // ---------- Capture buffer: 100 samples x 6 channels = 600 features ----------
 float sensor_data[INPUT_DIM];
-
-// ---------- Touch panel (CST816, same I2C bus as the IMU) ----------
-#define LCD_ROTATION 1
-#define LCD_WIDTH    240
-#define LCD_HEIGHT   320
-bool touch_ok = false;
 
 // ================= Sensor capture =================
 // 100 samples @ 50 Hz, order ax, ay, az, gx, gy, gz — matches the training CSVs.
@@ -76,10 +73,12 @@ void printWindowStats() {
 
 // ================= Motion trigger =================
 // The dataset windows start when the movement starts, so the classifier must do
-// the same: 'b' arms it, the capture begins at the first acceleration change.
+// the same: the capture begins at the first acceleration change.
 #define ACC_TRIGGER_G 0.20f
+// No movement above ACC_TRIGGER_G for this long is reported as NO_MOVEMENT.
+#define NO_MOVEMENT_MS 5000
 
-bool waitForMotion(uint32_t timeout_ms = 5000) {
+bool waitForMotion(float *base_x, float *base_y, float *base_z, uint32_t timeout_ms = NO_MOVEMENT_MS) {
   float ax0 = 0, ay0 = 0, az0 = 0;
   int   n = 0;
   uint32_t t0 = millis();
@@ -95,6 +94,7 @@ bool waitForMotion(uint32_t timeout_ms = 5000) {
   }
   if (n == 0) return false;
   ax0 /= n; ay0 /= n; az0 /= n;
+  *base_x = ax0; *base_y = ay0; *base_z = az0;
 
   t0 = millis();
   while (millis() - t0 < timeout_ms) {
@@ -108,6 +108,10 @@ bool waitForMotion(uint32_t timeout_ms = 5000) {
   }
   return false;
 }
+
+// Idle after a report so the current pose is not captured twice; the next loop
+// re-baselines and waits for a fresh movement before recording again.
+#define REPORT_COOLDOWN_MS 500
 
 // ================= Inference (int8) =================
 // TFLite's reference fixed-point helpers.
@@ -185,12 +189,8 @@ int classify(float *confidence) {
 void setup() {
   Serial.begin(115200);
 
-  Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);   // I2C for the QMI8658 (shared with touch)
+  Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);   // I2C for the QMI8658
   Wire.setClock(400000);
-
-  // Touch panel on the same bus — tap anywhere to start a detection.
-  touch_ok = bsp_touch_init(&Wire, LCD_ROTATION, LCD_WIDTH, LCD_HEIGHT);
-  if (!touch_ok) Serial.println("Touch init failed (tap trigger disabled)");
 
   if (IMU.init(calib, IMU_ADDRESS) != 0) {
     Serial.println("IMU init failed");
@@ -217,44 +217,59 @@ void setup() {
   Serial.printf("accel at rest: ax=%.2f ay=%.2f az=%.2f | |a|=%.2f g (expect ~1.00)\n",
                 accelData.accelX, accelData.accelY, accelData.accelZ, gravity);
 
-  Serial.printf("Ready: %d classes, %d features, int8 %d layers. Tap screen or 'b' = classify\n",
+  Serial.printf("Ready: %d classes, %d features, int8 %d layers. Move and hold the gesture ~2 s\n",
                 NUM_CLASSES, INPUT_DIM, NUM_DENSE);
   Serial.printf("classes: 0=%s, 1=%s\n", GESTURE_CLASSES[0], GESTURE_CLASSES[1]);
 }
 
 void loop() {
-  bool trigger = false;
-
-  // serial trigger (kept for convenience)
-  if (Serial.available() && Serial.read() == 'b')
-    trigger = true;
-
-  // touch trigger: any tap on the display starts a detection
-  if (touch_ok) {
-    uint16_t tx = 0, ty = 0;
-    bsp_touch_read();
-    if (bsp_touch_get_coordinates(&tx, &ty))
-      trigger = true;
-  }
-
-  if (trigger) {
-    Serial.println("Move now...");
-    if (!waitForMotion()) {
-      Serial.println("#RESULT timeout (no movement)");
-    } else {
-      collectSensorData();
-      printWindowStats();
-
-      float conf = 0;
-      int cls = classify(&conf);
-      if (cls < 0) {
-        Serial.println("#RESULT error");
-      } else {
-        Serial.printf("#RESULT %d %s %.0f%%\n", cls, GESTURE_CLASSES[cls], conf * 100.0f);
-      }
+  // Continuous: wait for movement, classify the window, emit one JSON line.
+  // The idle event is printed once per idle period, not every timeout.
+  static bool idleReported = false;
+  float base_x = 0, base_y = 0, base_z = 0;
+  if (!waitForMotion(&base_x, &base_y, &base_z)) {
+    if (!idleReported) {
+      Serial.println("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
+      idleReported = true;
     }
+    return;
   }
-  delay(10);
+  idleReported = false;
+
+  // Alert the frontend before the 2 s window so it can show "recording".
+  Serial.println("{\"gesture\":-2,\"name\":\"MOVING\",\"confidence\":0}");
+
+  collectSensorData();
+
+  // The model was trained on the gesture held for the whole 2 s window, and it
+  // classifies rest as flexion. So ignore windows that end back at rest (a quick
+  // swing), and only report gestures that are still held when capture finishes.
+  constexpr int kSamples = INPUT_DIM / 6;
+  float end_x = 0, end_y = 0, end_z = 0;
+  for (int i = kSamples - 10; i < kSamples; i++) {
+    end_x += sensor_data[i * 6 + 0];
+    end_y += sensor_data[i * 6 + 1];
+    end_z += sensor_data[i * 6 + 2];
+  }
+  end_x /= 10; end_y /= 10; end_z /= 10;
+
+  const float held = fabsf(end_x - base_x) + fabsf(end_y - base_y) + fabsf(end_z - base_z);
+  if (held < 0.5f) {
+    // Quick swing back to neutral: no gesture, but still close the recording state.
+    Serial.println("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
+    idleReported = true;
+    delay(REPORT_COOLDOWN_MS);
+    return;
+  }
+
+  printWindowStats();
+
+  float conf = 0;
+  const int cls = classify(&conf);
+  Serial.printf("{\"gesture\":%d,\"name\":\"%s\",\"confidence\":%.2f}\n",
+                cls, GESTURE_CLASSES[cls], conf);
+
+  delay(REPORT_COOLDOWN_MS);
 }
 
 // =====================================================================
