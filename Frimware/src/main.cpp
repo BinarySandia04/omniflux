@@ -6,7 +6,7 @@
 // training data was recorded); a quick swing back to neutral is ignored.
 //
 // The network runs in int8 (same maths as TFLite's reference kernel), exported by
-// Train/export_int8.py from model_int8.tflite.
+// Train/export_int8.py from model_best_int8.tflite (the architecture-grid winner).
 //
 // The capture sketch (to record more dataset samples) is kept at the end, in `#if 0`.
 
@@ -25,7 +25,14 @@
 #include "scaler.h"              // g_mean, g_scale, INPUT_DIM, NUM_CLASSES, GESTURE_CLASSES
 #include "model_int8_weights.h"  // int8 weights, multipliers, quantisation params
 
-static_assert(INPUT_DIM == MODEL_IN_DIM, "model_int8_weights.h was exported for another input size");
+static_assert(INPUT_DIM % MODEL_IN_DIM == 0, "model input does not divide the raw window");
+
+// The grid-search model was trained on 4-frame average pooling (100 x 6 raw
+// samples -> 25 x 6 model inputs).
+constexpr int MODEL_POOL = INPUT_DIM / MODEL_IN_DIM;
+static_assert(MODEL_POOL > 0, "model input is larger than the raw window");
+static_assert(MODEL_IN_DIM % 6 == 0, "model input is not frame-major 6-axis data");
+static_assert(NUM_CLASSES == MODEL_OUT_DIM, "model output size does not match classes");
 
 // ---------- IMU (QMI8658, shares the I2C bus with the touch panel) ----------
 #define IMU_ADDRESS 0x6B
@@ -147,11 +154,20 @@ static int8_t q_in[MODEL_IN_DIM];
 static int8_t buf_a[MAX_UNITS];
 static int8_t buf_b[MAX_UNITS];
 
-// Fully connected int8 chain. Returns P(flexion).
-static float predict(const float *x_norm) {
-  for (int i = 0; i < MODEL_IN_DIM; i++) {
-    int q = (int)roundf(x_norm[i] / IN_SCALE) + IN_ZERO;
-    q_in[i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
+// Fully connected int8 chain followed by softmax. Fills probs[].
+static void predict(const float *x_norm, float *probs) {
+  // Normalised 100 x 6 window -> average every MODEL_POOL frames per axis,
+  // which is what the grid-search model was trained on.
+  constexpr int kChannels = 6;
+  for (int j = 0; j < MODEL_IN_DIM; j++) {
+    const int frame = j / kChannels;
+    const int channel = j % kChannels;
+    float sum = 0;
+    for (int k = 0; k < MODEL_POOL; k++)
+      sum += x_norm[(frame * MODEL_POOL + k) * kChannels + channel];
+
+    int q = (int)roundf(sum / (MODEL_POOL * IN_SCALE)) + IN_ZERO;
+    q_in[j] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
   }
 
   const int8_t *in = q_in;
@@ -176,18 +192,33 @@ static float predict(const float *x_norm) {
     out = (out == buf_a) ? buf_b : buf_a;
   }
 
-  const int logit = (int)in[0] - g_ozero[NUM_DENSE - 1];
-  return 1.0f / (1.0f + expf(-(float)logit * g_oscale[NUM_DENSE - 1][0]));
+  const int z_out = g_ozero[NUM_DENSE - 1];
+  const float scale = g_oscale[NUM_DENSE - 1][0];
+  float max_logit = -1e30f;
+  for (int i = 0; i < MODEL_OUT_DIM; i++) {
+    probs[i] = ((float)((int)in[i] - z_out)) * scale;
+    if (probs[i] > max_logit) max_logit = probs[i];
+  }
+  float sum = 0;
+  for (int i = 0; i < MODEL_OUT_DIM; i++) {
+    probs[i] = expf(probs[i] - max_logit);
+    sum += probs[i];
+  }
+  for (int i = 0; i < MODEL_OUT_DIM; i++) probs[i] /= sum;
 }
 
-// StandardScaler -> quantise -> network -> 0.5 threshold. Returns the class or -1.
+// StandardScaler -> quantise -> network -> argmax. Returns the class.
 int classify(float *confidence) {
   for (int i = 0; i < INPUT_DIM; i++)
     sensor_data[i] = (sensor_data[i] - g_mean[i]) / g_scale[i];
 
-  const float p = predict(sensor_data);   // 0..1, 1 = flexion
-  const int cls = p > 0.5f ? 1 : 0;
-  *confidence = cls ? p : 1.0f - p;
+  float probs[NUM_CLASSES];
+  predict(sensor_data, probs);
+
+  int cls = 0;
+  for (int i = 1; i < NUM_CLASSES; i++)
+    if (probs[i] > probs[cls]) cls = i;
+  *confidence = probs[cls];
   return cls;
 }
 
@@ -255,6 +286,11 @@ void emit(const char *line) {
 // ================= Setup / loop =================
 void setup() {
   Serial.begin(115200);
+  // When the dashboard reads over BLE, nothing consumes USB serial. Without
+  // this, a full CDC buffer blocks Serial writes for ~2 s and stalls the loop,
+  // which delays (or appears to drop) every BLE notification. Drop debug
+  // output instead.
+  Serial.setTxTimeoutMs(0);
   bleBegin();
 
   Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);   // I2C for the QMI8658
@@ -285,8 +321,8 @@ void setup() {
   Serial.printf("accel at rest: ax=%.2f ay=%.2f az=%.2f | |a|=%.2f g (expect ~1.00)\n",
                 accelData.accelX, accelData.accelY, accelData.accelZ, gravity);
 
-  Serial.printf("Ready: %d classes, %d features, int8 %d layers. Move and hold the gesture ~2 s\n",
-                NUM_CLASSES, INPUT_DIM, NUM_DENSE);
+  Serial.printf("Ready: %d classes, %d raw features -> %d model inputs (%d-frame avg), int8 %d layers. Move and hold the gesture ~2 s\n",
+                NUM_CLASSES, INPUT_DIM, MODEL_IN_DIM, MODEL_POOL, NUM_DENSE);
   Serial.printf("classes: 0=%s, 1=%s\n", GESTURE_CLASSES[0], GESTURE_CLASSES[1]);
 }
 
@@ -302,7 +338,7 @@ void loop() {
   float base_x = 0, base_y = 0, base_z = 0;
   if (!waitForMotion(&base_x, &base_y, &base_z)) {
     if (!idleReported) {
-      emit("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
+      emit("{\"player\":" STRINGIFY(PLAYER_ID) ",\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
       idleReported = true;
     }
     return;
@@ -310,7 +346,7 @@ void loop() {
   idleReported = false;
 
   // Alert the frontend before the 2 s window so it can show "recording".
-  emit("{\"gesture\":-2,\"name\":\"MOVING\",\"confidence\":0}");
+  emit("{\"player\":" STRINGIFY(PLAYER_ID) ",\"gesture\":-2,\"name\":\"MOVING\",\"confidence\":0}");
 
   collectSensorData();
 
@@ -329,7 +365,7 @@ void loop() {
   const float held = fabsf(end_x - base_x) + fabsf(end_y - base_y) + fabsf(end_z - base_z);
   if (held < 0.5f) {
     // Quick swing back to neutral: no gesture, but still close the recording state.
-    emit("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
+    emit("{\"player\":" STRINGIFY(PLAYER_ID) ",\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
     idleReported = true;
     delay(REPORT_COOLDOWN_MS);
     return;
@@ -339,9 +375,9 @@ void loop() {
 
   float conf = 0;
   const int cls = classify(&conf);
-  char line[96];
-  snprintf(line, sizeof(line), "{\"gesture\":%d,\"name\":\"%s\",\"confidence\":%.2f}",
-           cls, GESTURE_CLASSES[cls], conf);
+  char line[112];
+  snprintf(line, sizeof(line), "{\"player\":%d,\"gesture\":%d,\"name\":\"%s\",\"confidence\":%.2f}",
+           PLAYER_ID, cls, GESTURE_CLASSES[cls], conf);
   emit(line);
 
   delay(REPORT_COOLDOWN_MS);

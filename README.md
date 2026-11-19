@@ -20,12 +20,12 @@ With the ESP32 plugged in, from the repository root:
 ./start.sh
 ```
 
-This installs missing dependencies, flashes **two** boards (player 1, then it waits
-for you to swap in player 2), and starts the backend and frontend. Open
-<http://localhost:3000>; Ctrl-C stops both servers. Set `SERIAL_PORT=/dev/ttyACM0`
-if auto-detection picks the wrong port. The script asks whether the dashboard
-should receive data over USB serial or Bluetooth (`ble` is the default; use
-`serial` only for a single board over USB).
+This installs missing dependencies, flashes **two** boards (player 1, then player 2;
+they can be plugged in at the same time or swapped one at a time), and starts the
+backend and frontend. Open <http://localhost:3000>; Ctrl-C stops both servers. Set
+`SERIAL_PORT=/dev/ttyACM0` if auto-detection picks the wrong port. The script asks
+whether the dashboard should receive data over USB serial or Bluetooth (`ble` is
+the default; with USB, every flashed board is read on its own port).
 
 If your user cannot access the serial port, the script asks for your sudo password once and installs `/etc/udev/rules.d/99-omniflux-esp32.rules`, which makes ESP32 serial ports accessible without sudo from then on. If the upload still fails with "Permission denied", it retries the upload with sudo.
 
@@ -36,7 +36,7 @@ The manual steps are below.
 The firmware prints one JSON line per detected gesture on its USB serial port:
 
 ```json
-{"gesture":1,"name":"WRIST_FLEXION","confidence":0.87}
+{"player":1,"gesture":1,"name":"WRIST_FLEXION","confidence":0.87}
 ```
 
 Move into the gesture and **hold it for about 2 seconds**. The model was trained on held poses, so a quick swing that returns to neutral is ignored (the model would otherwise call the rest pose flexion).
@@ -46,7 +46,7 @@ status line. The dashboard shows it as "Recording…" while the window is captur
 then replaces it with the classified gesture or an idle line:
 
 ```json
-{"gesture":-2,"name":"MOVING","confidence":0}
+{"player":1,"gesture":-2,"name":"MOVING","confidence":0}
 ```
 
 After reporting, the firmware pauses 500 ms and then waits for the next motion
@@ -57,7 +57,7 @@ line instead. Idle events are shown on the dashboard but are not counted as
 gestures:
 
 ```json
-{"gesture":-1,"name":"NO_MOVEMENT","confidence":0}
+{"player":1,"gesture":-1,"name":"NO_MOVEMENT","confidence":0}
 ```
 
 ### Bluetooth (BLE)
@@ -88,7 +88,7 @@ the advertised prefix changes.
 ```bash
 cd backend
 npm install
-SERIAL_PORT=/dev/ttyACM0 npm start      # defaults to /dev/ttyACM1
+SERIAL_PORTS=/dev/ttyACM0,/dev/ttyACM1 npm start   # defaults to /dev/ttyACM1
 ```
 
 Listens on port `3001`. Endpoints:
@@ -96,11 +96,12 @@ Listens on port `3001`. Endpoints:
 - `GET /api/events` — SSE stream (`snapshot` events with full history + stats).
 - `GET /api/state` — current snapshot as JSON.
 
-`PORT`, `TRANSPORT` (`serial` or `ble`), `SERIAL_PORT`, `SERIAL_BAUD` (default
-`115200`) and `BLE_NAME` (default `OmniFlux`) are configurable via environment
-variables. On Linux the serial device usually needs group access
-(`sudo usermod -aG dialout $USER`, then log out and back in). USB serial carries
-one board; use `TRANSPORT=ble` for multiple players.
+`PORT`, `TRANSPORT` (`serial` or `ble`), `SERIAL_PORTS` (comma-separated, one per
+player), `SERIAL_PORT` (single-port shorthand), `SERIAL_BAUD` (default `115200`)
+and `BLE_NAME` (default `OmniFlux`) are configurable via environment variables.
+Each JSON line carries its player number, so the order of `SERIAL_PORTS` only
+matters for older firmware. On Linux the serial device usually needs group access
+(`sudo usermod -aG dialout $USER`, then log out and back in).
 
 ### 2. Frontend
 

@@ -177,10 +177,6 @@ onBeforeUnmount(() => {
     <div class="stage">
       <canvas ref="canvas" width="640" height="400" role="img" aria-label="Slow flappy bird controlled with wrist gestures" />
       <div v-if="!running" class="overlay">
-        <p>
-          Extend your wrist to go up, flex it to go down. Guide the bird through the
-          gaps — it moves slowly and only in the direction of your last gesture.
-        </p>
         <button type="button" @click="start">{{ over ? 'Play again' : 'Play' }}</button>
         <small v-if="best">Best: {{ best }}</small>
       </div>
@@ -188,7 +184,6 @@ onBeforeUnmount(() => {
 
     <div class="hint">
       <span>{{ recording ? 'Recording…' : 'Extension ↑ · Flexion ↓' }}</span>
-      <span>Gaps tighten every 5 pipes</span>
     </div>
   </section>
 </template>

@@ -2,7 +2,14 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 type Point = { t: number; player?: number; gesture: number; name: string; confidence: number }
-type Player = { id: number; name: string; connected: boolean }
+type Player = {
+  id: number
+  name: string
+  connected: boolean
+  transport?: 'serial' | 'ble'
+  last: Point | null
+  stats: { total: number; avgConfidence: number }
+}
 type Stats = { total: number; counts: Record<string, number>; avgConfidence: number }
 
 const apiBase = (useRuntimeConfig().public.apiBase as string).replace(/\/$/, '')
@@ -30,10 +37,18 @@ onBeforeUnmount(() => source?.close())
 
 const tab = ref<'game' | 'pong' | 'motion' | 'confidence'>('motion')
 
-const last = computed(() => history.value.at(-1))
-const idle = computed(() => last.value?.name === 'NO_MOVEMENT')
-const moving = computed(() => last.value?.name === 'MOVING')
 const pct = (value: number) => `${Math.round(value * 100)}%`
+
+// Only connected players get their own stats cards.
+const livePlayers = computed(() =>
+  players.value
+    .filter((player) => player.connected)
+    .map((player) => ({
+      ...player,
+      moving: player.last?.name === 'MOVING',
+      idle: player.last?.name === 'NO_MOVEMENT',
+    })),
+)
 
 const classes = computed(() =>
   Object.entries(stats.value.counts).map(([name, count]) => ({
@@ -73,22 +88,30 @@ const chart = computed(() => {
       </span>
     </header>
 
-    <section class="cards">
-      <article>
-        <span>Gestures</span>
-        <strong>{{ stats.total }}</strong>
-      </article>
-      <article>
-        <span>Last gesture</span>
-        <strong>{{ last ? (moving ? 'Recording…' : idle ? 'No movement' : last.name.replace('_', ' ')) : '—' }}</strong>
-        <small v-if="last && !idle && !moving">{{ pct(last.confidence) }} confidence</small>
-        <small v-else-if="moving">Gesture in progress</small>
-        <small v-else-if="idle">No movement detected</small>
-      </article>
-      <article>
-        <span>Average confidence</span>
-        <strong>{{ stats.total ? pct(stats.avgConfidence) : '—' }}</strong>
-      </article>
+    <section v-for="player in livePlayers" :key="player.id" class="player-stats">
+      <h2>Player {{ player.id }}</h2>
+      <div class="cards">
+        <article>
+          <span>Gestures</span>
+          <strong>{{ player.stats.total }}</strong>
+        </article>
+        <article>
+          <span>Last gesture</span>
+          <strong>{{ player.last ? (player.moving ? 'Recording…' : player.idle ? 'No movement' : player.last.name.replace('_', ' ')) : '—' }}</strong>
+          <small v-if="player.last && !player.idle && !player.moving">{{ pct(player.last.confidence) }} confidence</small>
+          <small v-else-if="player.moving">Gesture in progress</small>
+          <small v-else-if="player.idle">No movement detected</small>
+        </article>
+        <article>
+          <span>Connection</span>
+          <strong>{{ player.transport === 'ble' ? 'Bluetooth' : 'Serial' }}</strong>
+          <small>{{ player.name === 'serial' ? 'USB serial' : player.name }}</small>
+        </article>
+        <article>
+          <span>Average confidence</span>
+          <strong>{{ player.stats.total ? pct(player.stats.avgConfidence) : '—' }}</strong>
+        </article>
+      </div>
     </section>
 
     <nav class="tabs" role="tablist" aria-label="Dashboard sections">
@@ -253,6 +276,11 @@ header p {
 .tabs button:focus-visible {
   outline: 2px solid #60a5fa;
   outline-offset: -2px;
+}
+.player-stats h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  color: #9ca3af;
 }
 .cards {
   display: grid;

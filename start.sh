@@ -36,17 +36,32 @@ fi
 PIO_ABS="$(command -v "$PIO" || true)"
 PIO_ABS="${PIO_ABS:-$PIO}"
 
-# Two boards, one per ping-pong player. Player 1 is flashed first, then the
-# script waits for the second board to be connected and flashes it as player 2.
-PLAYERS=2
+# One board per ping-pong player; the firmware has an env per player.
+if [ -z "${PLAYERS:-}" ]; then
+  IFS= read -r -p "How many players to flash [1/2] (2): " PLAYERS || true
+  PLAYERS="${PLAYERS:-2}"
+fi
+case "$PLAYERS" in
+  1|2) ;;
+  *) echo "Invalid player count '$PLAYERS' (use 1 or 2)." >&2; exit 1 ;;
+esac
+export PLAYERS
 REQUESTED_SERIAL_PORT="${SERIAL_PORT:-}"
+USED_PORTS=""
+FLASHED_PORTS=()
 
 find_serial_port() {
   if [ -n "$REQUESTED_SERIAL_PORT" ]; then
     printf '%s' "$REQUESTED_SERIAL_PORT"
     return
   fi
-  ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | head -n 1 || true
+  local port
+  for port in /dev/ttyACM* /dev/ttyUSB*; do
+    [ -e "$port" ] || continue
+    case " $USED_PORTS " in *" $port "*) continue ;; esac
+    printf '%s' "$port"
+    return
+  done
 }
 
 # The ESP32's /dev/ttyACM* is root:dialout by default, which makes esptool and
@@ -96,7 +111,7 @@ for dir in backend frontend; do
 done
 
 if [ "$TRANSPORT" = serial ] && [ "$PLAYERS" -gt 1 ]; then
-  echo "==> Note: USB serial reads one board at a time; use Bluetooth for both players." >&2
+  echo "==> Serial mode: the backend will read each flashed board's port." >&2
 fi
 
 for ((player = 1; player <= PLAYERS; player++)); do
@@ -109,6 +124,8 @@ for ((player = 1; player <= PLAYERS; player++)); do
 
   echo "==> Flashing player $player/$PLAYERS (env player$player) on $SERIAL_PORT"
   upload_player "$player" "$SERIAL_PORT"
+  FLASHED_PORTS+=("$SERIAL_PORT")
+  USED_PORTS="$USED_PORTS $SERIAL_PORT"
 
   # The board re-enumerates after the upload reset; keep the port readable.
   for _ in $(seq 1 20); do
@@ -120,13 +137,19 @@ for ((player = 1; player <= PLAYERS; player++)); do
   done
 
   if (( player < PLAYERS )); then
-    echo
-    IFS= read -r -p "Unplug player $player, connect the next ESP32, then press Enter... " _ || true
+    # Wait for a swap only when no unused board is already plugged in.
+    if [ -z "$(find_serial_port)" ]; then
+      echo
+      IFS= read -r -p "Unplug player $player, connect the next ESP32, then press Enter... " _ || true
+      USED_PORTS=""   # the previous board is gone; its port can be reused
+    fi
   fi
 done
 
+SERIAL_PORTS="$(IFS=,; echo "${FLASHED_PORTS[*]}")"
+
 echo "==> Starting backend on http://localhost:3001 ($TRANSPORT)"
-TRANSPORT="$TRANSPORT" SERIAL_PORT="$SERIAL_PORT" node backend/server.js &
+TRANSPORT="$TRANSPORT" SERIAL_PORTS="$SERIAL_PORTS" node backend/server.js &
 BACKEND=$!
 
 echo "==> Starting frontend on http://localhost:3000"
