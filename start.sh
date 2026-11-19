@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
-# Flash the ESP32, then start the backend (USB serial reader) and the frontend.
+# Flash the ESP32, then start the backend (USB serial or Bluetooth reader) and
+# the frontend.
 #   ./start.sh
 #   SERIAL_PORT=/dev/ttyACM0 ./start.sh
+#   TRANSPORT=ble ./start.sh        # skip the transport prompt
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
+
+# The firmware sends over USB serial and BLE at the same time; this only picks
+# how the backend receives the data.
+if [ -z "${TRANSPORT:-}" ]; then
+  IFS= read -r -p "Transport for the dashboard [serial/ble] (ble): " TRANSPORT || true
+  TRANSPORT="${TRANSPORT:-ble}"
+fi
+case "$TRANSPORT" in
+  serial|ble) ;;
+  *) echo "Unknown transport '$TRANSPORT' (use serial or ble)." >&2; exit 1 ;;
+esac
+export TRANSPORT
 
 # Find PlatformIO.
 PIO="${PIO:-}"
@@ -22,24 +36,28 @@ fi
 PIO_ABS="$(command -v "$PIO" || true)"
 PIO_ABS="${PIO_ABS:-$PIO}"
 
-# Pick the ESP32's USB serial port unless SERIAL_PORT is already set.
-if [ -z "${SERIAL_PORT:-}" ]; then
-  SERIAL_PORT="$(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | head -n 1 || true)"
-fi
-if [ -z "$SERIAL_PORT" ]; then
-  echo "No ESP32 serial port found. Plug it in or set SERIAL_PORT." >&2
-  exit 1
-fi
-if [ ! -e "$SERIAL_PORT" ]; then
-  echo "Serial port $SERIAL_PORT does not exist." >&2
-  exit 1
-fi
+# Two boards, one per ping-pong player. Player 1 is flashed first, then the
+# script waits for the second board to be connected and flashes it as player 2.
+PLAYERS=2
+REQUESTED_SERIAL_PORT="${SERIAL_PORT:-}"
+
+find_serial_port() {
+  if [ -n "$REQUESTED_SERIAL_PORT" ]; then
+    printf '%s' "$REQUESTED_SERIAL_PORT"
+    return
+  fi
+  ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | head -n 1 || true
+}
 
 # The ESP32's /dev/ttyACM* is root:dialout by default, which makes esptool and
 # the backend fail with "Permission denied" for a normal user. Ask for sudo once
 # and install a udev rule so the board works after every replug and reset.
-if [ ! -r "$SERIAL_PORT" ] || [ ! -w "$SERIAL_PORT" ]; then
-  echo "==> $SERIAL_PORT is not accessible to $USER; installing a udev rule (sudo required once)"
+ensure_port_access() {
+  local port="$1"
+  if [ -r "$port" ] && [ -w "$port" ]; then
+    return
+  fi
+  echo "==> $port is not accessible to $USER; installing a udev rule (sudo required once)"
   sudo tee /etc/udev/rules.d/99-omniflux-esp32.rules >/dev/null <<'EOF'
 # OmniFlux: allow non-root access to ESP32 USB serial ports.
 KERNEL=="ttyACM[0-9]*", SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", MODE="0666"
@@ -49,10 +67,26 @@ EOF
   sudo udevadm trigger --subsystem-match=tty
   sleep 1
   # Fallback for this session if udev did not pick the rule up.
-  if [ ! -r "$SERIAL_PORT" ] || [ ! -w "$SERIAL_PORT" ]; then
-    sudo chmod a+rw "$SERIAL_PORT"
+  if [ ! -r "$port" ] || [ ! -w "$port" ]; then
+    sudo chmod a+rw "$port"
   fi
-fi
+}
+
+upload_player() {
+  local player="$1" port="$2" upload_log
+  if ! upload_log="$("$PIO" run -d Frimware -e "player$player" -t upload --upload-port "$port" 2>&1)"; then
+    printf '%s\n' "$upload_log"
+    if grep -qi "permission denied" <<<"$upload_log"; then
+      echo "==> Port access denied; retrying the upload with sudo"
+      sudo env HOME="$HOME" PLATFORMIO_CORE_DIR="${PLATFORMIO_CORE_DIR:-$HOME/.platformio}" \
+        "$PIO_ABS" run -d Frimware -e "player$player" -t upload --upload-port "$port"
+    else
+      exit 1
+    fi
+  else
+    printf '%s\n' "$upload_log"
+  fi
+}
 
 for dir in backend frontend; do
   if [ ! -d "$dir/node_modules" ]; then
@@ -61,34 +95,38 @@ for dir in backend frontend; do
   fi
 done
 
-echo "==> Building firmware"
-"$PIO" run -d Frimware -e esp32_s3_touch_lcd_2
-
-echo "==> Uploading firmware to $SERIAL_PORT"
-if ! upload_log="$("$PIO" run -d Frimware -e esp32_s3_touch_lcd_2 -t upload --upload-port "$SERIAL_PORT" 2>&1)"; then
-  printf '%s\n' "$upload_log"
-  if grep -qi "permission denied" <<<"$upload_log"; then
-    echo "==> Port access denied; retrying the upload with sudo"
-    sudo env HOME="$HOME" PLATFORMIO_CORE_DIR="${PLATFORMIO_CORE_DIR:-$HOME/.platformio}" \
-      "$PIO_ABS" run -d Frimware -e esp32_s3_touch_lcd_2 -t upload --upload-port "$SERIAL_PORT"
-  else
-    exit 1
-  fi
-else
-  printf '%s\n' "$upload_log"
+if [ "$TRANSPORT" = serial ] && [ "$PLAYERS" -gt 1 ]; then
+  echo "==> Note: USB serial reads one board at a time; use Bluetooth for both players." >&2
 fi
 
-# The board re-enumerates after the upload reset; make sure the port stays readable.
-for _ in $(seq 1 20); do
-  if [ -r "$SERIAL_PORT" ] && [ -w "$SERIAL_PORT" ]; then
-    break
+for ((player = 1; player <= PLAYERS; player++)); do
+  SERIAL_PORT="$(find_serial_port)"
+  if [ -z "$SERIAL_PORT" ] || [ ! -e "$SERIAL_PORT" ]; then
+    echo "No ESP32 serial port found for player $player. Plug it in or set SERIAL_PORT." >&2
+    exit 1
   fi
-  sudo chmod a+rw "$SERIAL_PORT" 2>/dev/null || true
-  sleep 0.5
+  ensure_port_access "$SERIAL_PORT"
+
+  echo "==> Flashing player $player/$PLAYERS (env player$player) on $SERIAL_PORT"
+  upload_player "$player" "$SERIAL_PORT"
+
+  # The board re-enumerates after the upload reset; keep the port readable.
+  for _ in $(seq 1 20); do
+    if [ -r "$SERIAL_PORT" ] && [ -w "$SERIAL_PORT" ]; then
+      break
+    fi
+    sudo chmod a+rw "$SERIAL_PORT" 2>/dev/null || true
+    sleep 0.5
+  done
+
+  if (( player < PLAYERS )); then
+    echo
+    IFS= read -r -p "Unplug player $player, connect the next ESP32, then press Enter... " _ || true
+  fi
 done
 
-echo "==> Starting backend on http://localhost:3001"
-SERIAL_PORT="$SERIAL_PORT" node backend/server.js &
+echo "==> Starting backend on http://localhost:3001 ($TRANSPORT)"
+TRANSPORT="$TRANSPORT" SERIAL_PORT="$SERIAL_PORT" node backend/server.js &
 BACKEND=$!
 
 echo "==> Starting frontend on http://localhost:3000"

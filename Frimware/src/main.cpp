@@ -1,6 +1,6 @@
 // OmniFlux — wrist extension / flexion recognition on the ESP32-S3.
-// Runs continuously: every detected movement is classified and printed as one
-// JSON line on the USB serial port, e.g.
+// Runs continuously: every detected movement is classified and emitted as one
+// JSON line on the USB serial port and over Bluetooth LE, e.g.
 //   {"gesture":1,"name":"FLEXION","confidence":0.87}
 // The gesture must be held through the 2 s capture window (that is how the
 // training data was recorded); a quick swing back to neutral is ignored.
@@ -14,6 +14,12 @@
 #include <Wire.h>
 #include <math.h>
 #include <stdint.h>
+
+#include <BLE2902.h>
+#include <BLECharacteristic.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
 
 #include "FastIMU.h"
 #include "scaler.h"              // g_mean, g_scale, INPUT_DIM, NUM_CLASSES, GESTURE_CLASSES
@@ -185,9 +191,71 @@ int classify(float *confidence) {
   return cls;
 }
 
+// ================= Bluetooth (BLE) =================
+// Same JSON lines as the USB serial port, notified to a BLE client (the backend
+// connects with TRANSPORT=ble). Nordic UART service UUIDs, so any generic BLE
+// UART app can read the stream too.
+// Each board advertises a numbered name so the backend can tell the players
+// apart; start.sh flashes player1/player2 with different PLAYER_ID values.
+#ifndef PLAYER_ID
+#define PLAYER_ID 1
+#endif
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x)  STRINGIFY_(x)
+#define BLE_NAME      "OmniFlux-" STRINGIFY(PLAYER_ID)
+#define BLE_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+static BLECharacteristic *ble_tx = nullptr;
+static volatile bool ble_connected = false;
+static volatile bool ble_restart_advertising = false;
+
+class BleServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *server) override { ble_connected = true; }
+  void onDisconnect(BLEServer *server) override {
+    ble_connected = false;
+    ble_restart_advertising = true;   // restarting from the loop is more reliable
+  }
+};
+
+void bleBegin() {
+  BLEDevice::init(BLE_NAME);
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new BleServerCallbacks());
+
+  BLEService *service = server->createService(BLE_SERVICE_UUID);
+  ble_tx = service->createCharacteristic(BLE_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  ble_tx->addDescriptor(new BLE2902());
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+  Serial.println("BLE: advertising as " BLE_NAME);
+}
+
+// Write one JSON line to USB serial and to any connected BLE client. The
+// default 23-byte ATT MTU leaves 20 bytes of payload and Web Bluetooth cannot
+// request a larger one, so split the line; the client reassembles on '\n'.
+void emit(const char *line) {
+  Serial.println(line);
+  if (!ble_connected || ble_tx == nullptr) return;
+
+  const String framed = String(line) + "\n";
+  for (size_t i = 0; i < framed.length(); i += 20) {
+    const size_t remaining = framed.length() - i;
+    const size_t n = remaining < 20 ? remaining : 20;
+    ble_tx->setValue((const uint8_t *)framed.c_str() + i, n);
+    ble_tx->notify();
+    delay(20);   // pace notifications so a slow client does not drop them
+  }
+}
+
 // ================= Setup / loop =================
 void setup() {
   Serial.begin(115200);
+  bleBegin();
 
   Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);   // I2C for the QMI8658
   Wire.setClock(400000);
@@ -223,13 +291,18 @@ void setup() {
 }
 
 void loop() {
+  if (ble_restart_advertising) {
+    ble_restart_advertising = false;
+    BLEDevice::startAdvertising();
+  }
+
   // Continuous: wait for movement, classify the window, emit one JSON line.
   // The idle event is printed once per idle period, not every timeout.
   static bool idleReported = false;
   float base_x = 0, base_y = 0, base_z = 0;
   if (!waitForMotion(&base_x, &base_y, &base_z)) {
     if (!idleReported) {
-      Serial.println("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
+      emit("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
       idleReported = true;
     }
     return;
@@ -237,7 +310,7 @@ void loop() {
   idleReported = false;
 
   // Alert the frontend before the 2 s window so it can show "recording".
-  Serial.println("{\"gesture\":-2,\"name\":\"MOVING\",\"confidence\":0}");
+  emit("{\"gesture\":-2,\"name\":\"MOVING\",\"confidence\":0}");
 
   collectSensorData();
 
@@ -256,7 +329,7 @@ void loop() {
   const float held = fabsf(end_x - base_x) + fabsf(end_y - base_y) + fabsf(end_z - base_z);
   if (held < 0.5f) {
     // Quick swing back to neutral: no gesture, but still close the recording state.
-    Serial.println("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
+    emit("{\"gesture\":-1,\"name\":\"NO_MOVEMENT\",\"confidence\":0}");
     idleReported = true;
     delay(REPORT_COOLDOWN_MS);
     return;
@@ -266,8 +339,10 @@ void loop() {
 
   float conf = 0;
   const int cls = classify(&conf);
-  Serial.printf("{\"gesture\":%d,\"name\":\"%s\",\"confidence\":%.2f}\n",
-                cls, GESTURE_CLASSES[cls], conf);
+  char line[96];
+  snprintf(line, sizeof(line), "{\"gesture\":%d,\"name\":\"%s\",\"confidence\":%.2f}",
+           cls, GESTURE_CLASSES[cls], conf);
+  emit(line);
 
   delay(REPORT_COOLDOWN_MS);
 }

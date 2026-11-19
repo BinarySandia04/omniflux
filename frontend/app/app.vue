@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
-type Point = { t: number; gesture: number; name: string; confidence: number }
+type Point = { t: number; player?: number; gesture: number; name: string; confidence: number }
+type Player = { id: number; name: string; connected: boolean }
 type Stats = { total: number; counts: Record<string, number>; avgConfidence: number }
 
 const apiBase = (useRuntimeConfig().public.apiBase as string).replace(/\/$/, '')
 
 const history = ref<Point[]>([])
+const players = ref<Player[]>([])
 const stats = ref<Stats>({ total: 0, counts: {}, avgConfidence: 0 })
 const connected = ref(false)
 let source: EventSource | undefined
@@ -17,6 +19,7 @@ onMounted(() => {
   source.addEventListener('snapshot', (event) => {
     const data = JSON.parse((event as MessageEvent).data)
     history.value = data.history
+    players.value = data.players ?? []
     stats.value = data.stats
   })
   source.onopen = () => { connected.value = true }
@@ -25,7 +28,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => source?.close())
 
-const tab = ref<'game' | 'motion' | 'confidence'>('motion')
+const tab = ref<'game' | 'pong' | 'motion' | 'confidence'>('motion')
 
 const last = computed(() => history.value.at(-1))
 const idle = computed(() => last.value?.name === 'NO_MOVEMENT')
@@ -63,7 +66,7 @@ const chart = computed(() => {
     <header>
       <div>
         <h1>OmniFlux</h1>
-        <p>Live wrist gesture recognition over USB serial</p>
+        <p>Live wrist gesture recognition over USB serial or Bluetooth</p>
       </div>
       <span class="badge" :class="connected ? 'on' : 'off'" aria-live="polite">
         {{ connected ? 'Live' : 'Disconnected' }}
@@ -98,9 +101,13 @@ const chart = computed(() => {
       <button role="tab" :aria-selected="tab === 'game'" :class="{ active: tab === 'game' }" @click="tab = 'game'">
         Wrist Flappy
       </button>
+      <button role="tab" :aria-selected="tab === 'pong'" :class="{ active: tab === 'pong' }" @click="tab = 'pong'">
+        Ping Pong
+      </button>
     </nav>
 
     <GestureGame v-if="tab === 'game'" :history="history" />
+    <PingPongGame v-if="tab === 'pong'" :history="history" :players="players" />
 
     <section v-if="tab === 'motion'" class="panel">
       <h2>Wrist motion</h2>
