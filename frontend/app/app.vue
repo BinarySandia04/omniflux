@@ -25,6 +25,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => source?.close())
 
+const tab = ref<'game' | 'motion' | 'confidence'>('motion')
+
 const last = computed(() => history.value.at(-1))
 const idle = computed(() => last.value?.name === 'NO_MOVEMENT')
 const moving = computed(() => last.value?.name === 'MOVING')
@@ -86,7 +88,21 @@ const chart = computed(() => {
       </article>
     </section>
 
-    <section class="panel">
+    <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+      <button role="tab" :aria-selected="tab === 'motion'" :class="{ active: tab === 'motion' }" @click="tab = 'motion'">
+        Wrist motion
+      </button>
+      <button role="tab" :aria-selected="tab === 'confidence'" :class="{ active: tab === 'confidence' }" @click="tab = 'confidence'">
+        Confidence
+      </button>
+      <button role="tab" :aria-selected="tab === 'game'" :class="{ active: tab === 'game' }" @click="tab = 'game'">
+        Wrist Flappy
+      </button>
+    </nav>
+
+    <GestureGame v-if="tab === 'game'" :history="history" />
+
+    <section v-if="tab === 'motion'" class="panel">
       <h2>Wrist motion</h2>
       <svg viewBox="0 0 260 170" class="wrist" role="img" aria-label="Animated wrist extension and flexion">
         <defs>
@@ -126,7 +142,7 @@ const chart = computed(() => {
       </div>
     </section>
 
-    <section class="panel">
+    <section v-if="tab === 'confidence'" class="panel">
       <h2>Confidence</h2>
       <svg viewBox="0 0 120 40" role="img" aria-label="Confidence of the last gestures">
         <line v-for="v in [0, 0.5, 1]" :key="v" x1="0" :y1="36 - v * 32" x2="120" :y2="36 - v * 32" class="grid" />
@@ -140,7 +156,7 @@ const chart = computed(() => {
       </div>
     </section>
 
-    <section class="panel">
+    <section v-if="tab === 'confidence'" class="panel">
       <h2>Class distribution</h2>
       <p v-if="!classes.length" class="empty">Waiting for gestures…</p>
       <div v-for="c in classes" :key="c.name" class="row">
@@ -203,6 +219,33 @@ header p {
 .badge.off {
   background: #2b1116;
   color: #f87171;
+}
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid #232833;
+}
+.tabs button {
+  padding: 8px 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: #9ca3af;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.tabs button:hover {
+  color: #e5e7eb;
+}
+.tabs button.active {
+  color: #e5e7eb;
+  border-bottom-color: #34d399;
+}
+.tabs button:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: -2px;
 }
 .cards {
   display: grid;
